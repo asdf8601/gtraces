@@ -183,7 +183,9 @@ def _parse_labels(label_tuple):
     return d or None
 
 
-def _build_params(start, end, limit, view="ROOTSPAN", min_latency=None):
+def _build_params(
+    start, end, limit, view="ROOTSPAN", min_latency=None, services=None, labels=None
+):
     """Build common API query params."""
     params = {
         "pageSize": min(limit, 100),
@@ -191,9 +193,19 @@ def _build_params(start, end, limit, view="ROOTSPAN", min_latency=None):
         "endTime": end or _now(),
         "view": view,
     }
+    parts = []
     if min_latency:
-        filt, _ = parse_latency(min_latency)
-        params["filter"] = f"latency:{filt}"
+        filt, ms = parse_latency(min_latency)
+        if ms and ms > 0:
+            parts.append(f"latency:{filt}")
+    if services:
+        for svc in services:
+            parts.append(f"service.name:{svc}")
+    if labels:
+        for k, v in labels.items():
+            parts.append(f"{k}:{v}")
+    if parts:
+        params["filter"] = " ".join(parts)
     return params
 
 
@@ -219,9 +231,12 @@ def filter_traces(
             continue
         if max_ms is not None and dur > max_ms:
             continue
-        rl = r.get("labels", {})
-        if svc_set and rl.get("service.name") not in svc_set:
+        if svc_set and not any(
+            s.get("labels", {}).get("service.name") in svc_set
+            for s in t.get("spans", [])
+        ):
             continue
+        rl = r.get("labels", {})
         if labels and not all(rl.get(k) == v for k, v in labels.items()):
             continue
         out.append(t)
@@ -258,23 +273,99 @@ def _resolve_threshold(threshold, pvals):
     return ms
 
 
+def _pcts(values):
+    """Compute p50/p90/p95/p99 from a sorted list of numbers."""
+    n = len(values)
+    if n == 0:
+        return {"p50": 0, "p90": 0, "p95": 0, "p99": 0}
+    targets = {"p50": 0.50, "p90": 0.90, "p95": 0.95, "p99": 0.99}
+    return {k: values[min(int(v * n), n - 1)] for k, v in targets.items()}
+
+
 # ── Rendering ────────────────────────────────────────────────────────────────
 
 
-def render_list(traces):
-    """Render traces as a compact table."""
+def _parse_fields(field_str):
+    """Parse comma-separated field spec (e.g. 'spans,label:cloud.region')."""
+    if not field_str:
+        return []
+    fields = []
+    for f in field_str.split(","):
+        f = f.strip()
+        if f.startswith("label:"):
+            key = f[6:]
+            fields.append({"type": "label", "key": key, "header": key})
+        elif f == "spans":
+            fields.append({"type": "spans", "header": "SPANS"})
+        else:
+            raise click.BadParameter(
+                f"Unknown field: {f}  (use 'spans' or 'label:KEY')"
+            )
+    return fields
+
+
+def _extract_field(t, root, field):
+    """Extract a field value from a trace."""
+    if field["type"] == "label":
+        return (root or {}).get("labels", {}).get(field["key"], "")
+    if field["type"] == "spans":
+        return str(len(t.get("spans", [])))
+    return ""
+
+
+def render_list(traces, show_labels=False, fields=None):
+    """Render traces as a compact table with dynamic column widths."""
     if not traces:
         click.echo("No traces found.")
         return
-    click.echo(f"{'TRACE ID':<36}  {'ROOT SPAN':<40}  {'DURATION':>10}  TIME")
-    click.echo("\u2500" * 100)
+
+    SEP = "  "
+
+    # Pre-compute all cell values per row
+    headers = ["TRACE ID", "ROOT SPAN", "DURATION", "TIME"]
+    extra_headers = [f["header"] for f in fields] if fields else []
+    all_headers = headers + extra_headers
+
+    rows = []
     for t in traces:
         r = _root(t.get("spans", []))
         tid = t.get("traceId", "?")
-        name = (r.get("name", "?") if r else "?")[:40]
-        d = _fmt_ms(_dur(r)) if r else "?"
+        name = r.get("name", "?") if r else "?"
+        dur = _fmt_ms(_dur(r)) if r else "?"
         time = r.get("startTime", "?")[:19] if r else "?"
-        click.echo(f"{tid:<36}  {name:<40}  {d:>10}  {time}")
+        extra = [_extract_field(t, r, f) for f in fields] if fields else []
+        lbl_str = ""
+        if show_labels and r:
+            lbl = r.get("labels", {})
+            interesting = {k: v for k, v in lbl.items() if k in INTERESTING_LABELS}
+            if interesting:
+                lbl_str = " ".join(f"{k}={v}" for k, v in interesting.items())
+        rows.append(([tid, name, dur, time] + extra, lbl_str))
+
+    # Compute column widths from header + data
+    col_widths = [len(h) for h in all_headers]
+    for cells, _ in rows:
+        for i, val in enumerate(cells):
+            col_widths[i] = max(col_widths[i], len(val))
+
+    # Right-align DURATION column (index 2)
+    right_align = {2}
+
+    def fmt_row(cells):
+        parts = []
+        for i, val in enumerate(cells):
+            w = col_widths[i]
+            parts.append(f"{val:>{w}}" if i in right_align else f"{val:<{w}}")
+        return SEP.join(parts)
+
+    click.echo(fmt_row(all_headers) + (SEP + "LABELS" if show_labels else ""))
+    click.echo("\u2500" * sum(col_widths + [len(SEP) * (len(col_widths) - 1)]))
+
+    for cells, lbl_str in rows:
+        line = fmt_row(cells)
+        if lbl_str:
+            line += SEP + lbl_str
+        click.echo(line)
 
 
 def _bar(offset_ms, dur_ms, total_ms, width):
@@ -632,6 +723,22 @@ def get(ctx, trace_id, bars, name_width):
     default=None,
     help="Find spans with this parentSpanId (fetches full traces)",
 )
+@click.option("--show-labels", is_flag=True, help="Show interesting labels in output")
+@click.option(
+    "--extra-fields",
+    "field_str",
+    default=None,
+    help="Extra columns (e.g. spans,label:cloud.region,label:placement)",
+)
+@click.option(
+    "--order-asc", default=None, type=click.Choice(["duration"]), help="Sort ascending"
+)
+@click.option(
+    "--order-desc",
+    default=None,
+    type=click.Choice(["duration"]),
+    help="Sort descending",
+)
 @click.pass_context
 def search(
     ctx,
@@ -644,6 +751,10 @@ def search(
     max_latency,
     service,
     parent_span_id,
+    show_labels,
+    field_str,
+    order_asc,
+    order_desc,
 ):
     """Search traces with client-side filtering.
 
@@ -658,29 +769,41 @@ def search(
     """
     p = ctx.obj["project"]
     label_dict = _parse_labels(labels)
+    fields = _parse_fields(field_str)
     _, min_ms = parse_latency(min_latency)
     _, max_ms = parse_latency(max_latency)
     view = "COMPLETE" if parent_span_id else "ROOTSPAN"
-    params = _build_params(start, end, limit, view=view, min_latency=min_latency)
+    params = _build_params(
+        start,
+        end,
+        limit,
+        view=view,
+        min_latency=min_latency,
+        services=service,
+        labels=label_dict,
+    )
     traces = fetch_traces(p, params, max_results=limit)
 
-    # Pre-filter by service/labels on root span
-    if service or label_dict:
-        traces = filter_traces(traces, services=service, labels=label_dict)
+    if order_asc and order_desc:
+        raise click.UsageError("Cannot use both --order-asc and --order-desc")
 
     if not parent_span_id:
-        # Fast path: root-span-only filtering
+        # Client-side filters that can't be pushed server-side
         filtered = filter_traces(
             traces,
             span_name=span_name,
-            labels=label_dict,
             min_ms=min_ms,
             max_ms=max_ms,
         )
+        if order_asc or order_desc:
+            reverse = order_desc is not None
+            filtered.sort(
+                key=lambda t: _dur(_root(t.get("spans", [])) or {}), reverse=reverse
+            )
         if ctx.obj["json"]:
             click.echo(json.dumps(filtered, indent=2))
         else:
-            render_list(filtered)
+            render_list(filtered, show_labels=show_labels, fields=fields)
             if traces:
                 click.echo(f"\n{len(filtered)}/{len(traces)} traces matched.")
         return
@@ -932,12 +1055,18 @@ def outliers(
     as_json = ctx.obj["json"]
     label_dict = _parse_labels(labels)
     _, max_ms = parse_latency(max_latency)
-    params = _build_params(start, end, limit, view="COMPLETE", min_latency=min_latency)
+    params = _build_params(
+        start,
+        end,
+        limit,
+        view="COMPLETE",
+        min_latency=min_latency,
+        services=service,
+        labels=label_dict,
+    )
 
     all_traces = fetch_traces(p, params, max_results=limit)
-    filtered = filter_traces(
-        all_traces, services=service, labels=label_dict, max_ms=max_ms
-    )
+    filtered = filter_traces(all_traces, max_ms=max_ms)
     durations = _to_durations(filtered)
 
     if not durations:
@@ -1033,6 +1162,177 @@ def outliers(
         if comparison:
             out["comparison"] = comparison
         click.echo(json.dumps(out, indent=2))
+
+
+# ── Stats command ────────────────────────────────────────────────────────────
+
+
+@cli.command()
+@click.option(
+    "--start",
+    default="1h",
+    show_default=True,
+    help="Start time (1h, 30m, 2d, or RFC3339)",
+)
+@click.option("--end", default=None, help="End time (default: now)")
+@click.option(
+    "--limit", default=100, show_default=True, type=int, help="Traces to scan"
+)
+@click.option(
+    "--span", "span_pattern", default=None, help="Span name filter (substring match)"
+)
+@click.option(
+    "--group-by",
+    "group_by",
+    default=None,
+    help="Comma-separated label keys to group by",
+)
+@click.option(
+    "--service", "service", multiple=True, help="Filter by service.name (repeatable)"
+)
+@click.option("--label", "labels", multiple=True, help="Label key=value (repeatable)")
+@click.option(
+    "--min-latency", default=None, help="Min latency filter on trace (500ms, 1s)"
+)
+@click.option(
+    "--max-latency", default=None, help="Max latency filter on trace (500ms, 1s)"
+)
+@click.pass_context
+def stats(
+    ctx,
+    start,
+    end,
+    limit,
+    span_pattern,
+    group_by,
+    service,
+    labels,
+    min_latency,
+    max_latency,
+):
+    """Latency stats, optionally grouped by span labels.
+
+    Collects matching spans from fetched traces and computes percentile
+    distributions.  Use --group-by to break down by one or more label keys.
+
+    \b
+    Examples:
+      gct stats --span "POST /v1/rtb" --group-by cloud.region
+      gct stats --span HTTP --group-by cloud.region,service.name
+      gct stats --service my-service --group-by abtest
+    """
+    p = ctx.obj["project"]
+    as_json = ctx.obj["json"]
+    label_dict = _parse_labels(labels)
+    _, max_ms = parse_latency(max_latency)
+    group_keys = [k.strip() for k in group_by.split(",")] if group_by else []
+
+    params = _build_params(
+        start,
+        end,
+        limit,
+        view="COMPLETE",
+        min_latency=min_latency,
+        services=service,
+        labels=label_dict,
+    )
+    all_traces = fetch_traces(p, params, max_results=limit)
+    filtered = filter_traces(all_traces, max_ms=max_ms)
+
+    if not filtered:
+        click.echo("No traces found.")
+        return
+
+    # Collect matching spans into groups
+    groups = defaultdict(list)
+    total_spans = 0
+
+    for t in filtered:
+        for s in t.get("spans", []):
+            if span_pattern and span_pattern not in s.get("name", ""):
+                continue
+            total_spans += 1
+            dur = _dur(s)
+            if group_keys:
+                lbl = s.get("labels", {})
+                key = tuple(lbl.get(k, "") for k in group_keys)
+                groups[key].append(dur)
+            else:
+                groups[()].append(dur)
+
+    if not total_spans:
+        click.echo("No spans matched.")
+        return
+
+    for durs in groups.values():
+        durs.sort()
+
+    sorted_groups = sorted(groups.items(), key=lambda x: -len(x[1]))
+
+    # ── JSON output ──────────────────────────────────────────────────────
+    if as_json:
+        json_groups = []
+        for key, durs in sorted_groups:
+            entry = {
+                "count": len(durs),
+                "avgMs": round(sum(durs) / len(durs), 1),
+                "percentiles": {k: round(v, 1) for k, v in _pcts(durs).items()},
+            }
+            if group_keys:
+                entry["key"] = dict(zip(group_keys, key))
+            json_groups.append(entry)
+        out = {
+            "totalSpans": total_spans,
+            "totalTraces": len(filtered),
+            "groups": json_groups,
+        }
+        if span_pattern:
+            out["span"] = span_pattern
+        if group_keys:
+            out["groupBy"] = group_keys
+        click.echo(json.dumps(out, indent=2))
+        return
+
+    # ── Text output ──────────────────────────────────────────────────────
+    desc = f"Latency stats ({total_spans} spans across {len(filtered)} traces)"
+    if span_pattern:
+        desc += f'  span ~ "{span_pattern}"'
+    click.echo(desc)
+    click.echo()
+
+    if group_keys:
+        rows = []
+        for key, durs in sorted_groups:
+            label = " ".join(f"{k}={v or '(none)'}" for k, v in zip(group_keys, key))
+            rows.append((label, durs))
+
+        max_lbl = max(len(r[0]) for r in rows)
+        max_lbl = max(max_lbl, 5)
+
+        click.echo(
+            f"{'GROUP':<{max_lbl}}  {'COUNT':>6}  "
+            f"{'avg':>10}  {'p50':>10}  {'p90':>10}  {'p95':>10}  {'p99':>10}"
+        )
+        click.echo("\u2500" * (max_lbl + 68))
+
+        for label, durs in rows:
+            avg = sum(durs) / len(durs)
+            pv = _pcts(durs)
+            click.echo(
+                f"{label:<{max_lbl}}  {len(durs):>6}  "
+                f"{_fmt_ms(avg):>10}  {_fmt_ms(pv['p50']):>10}  "
+                f"{_fmt_ms(pv['p90']):>10}  {_fmt_ms(pv['p95']):>10}  "
+                f"{_fmt_ms(pv['p99']):>10}"
+            )
+    else:
+        durs = sorted_groups[0][1]
+        avg = sum(durs) / len(durs)
+        pv = _pcts(durs)
+        click.echo(f"  avg  {_fmt_ms(avg)}")
+        for label, ms in pv.items():
+            click.echo(f"  {label}  {_fmt_ms(ms)}")
+
+    click.echo()
 
 
 if __name__ == "__main__":
