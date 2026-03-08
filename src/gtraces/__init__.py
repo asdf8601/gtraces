@@ -146,7 +146,7 @@ def _now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def parse_time(s):
+def _parse_time(s):
     """Parse relative (1h, 30m, 2d) or RFC3339 to RFC3339 string."""
     m = re.match(r"^(\d+)([mhd])$", s)
     if m:
@@ -160,7 +160,7 @@ def parse_time(s):
     return s
 
 
-def parse_latency(s):
+def _parse_latency(s):
     """Parse '500ms' or '1.5s' to (api_filter_str, ms_float). Returns (None, None) if empty."""
     if not s:
         return None, None
@@ -189,13 +189,13 @@ def _build_params(
     """Build common API query params."""
     params = {
         "pageSize": min(limit, 100),
-        "startTime": parse_time(start),
+        "startTime": _parse_time(start),
         "endTime": end or _now(),
         "view": view,
     }
     parts = []
     if min_latency:
-        filt, ms = parse_latency(min_latency)
+        filt, ms = _parse_latency(min_latency)
         if ms and ms > 0:
             parts.append(f"latency:{filt}")
     if services:
@@ -224,7 +224,7 @@ def filter_traces(
         r = _root(t.get("spans", []))
         if not r:
             continue
-        if span_name and r.get("name") != span_name:
+        if span_name and span_name not in (r.get("name") or ""):
             continue
         dur = _dur(r)
         if min_ms is not None and dur < min_ms:
@@ -254,18 +254,11 @@ def _to_durations(traces):
     return out
 
 
-def _percentiles(durations):
-    """Compute p50/p90/p95/p99 from a sorted list of (ms, trace) tuples."""
-    n = len(durations)
-    pcts = {"p50": 0.50, "p90": 0.90, "p95": 0.95, "p99": 0.99}
-    return {k: durations[min(int(v * n), n - 1)][0] for k, v in pcts.items()}
-
-
 def _resolve_threshold(threshold, pvals):
     """Resolve a threshold string to milliseconds."""
     if threshold in pvals:
         return pvals[threshold]
-    _, ms = parse_latency(threshold)
+    _, ms = _parse_latency(threshold)
     if ms is None:
         raise click.BadParameter(
             f"Bad threshold: {threshold} (use p50/p90/p95/p99 or e.g. 500ms)"
@@ -280,6 +273,91 @@ def _pcts(values):
         return {"p50": 0, "p90": 0, "p95": 0, "p99": 0}
     targets = {"p50": 0.50, "p90": 0.90, "p95": 0.95, "p99": 0.99}
     return {k: values[min(int(v * n), n - 1)] for k, v in targets.items()}
+
+
+# ── Timeseries helpers ───────────────────────────────────────────────────────
+
+_SPARK = "▁▂▃▄▅▆▇█"
+
+
+def _sparkline(values):
+    """Render a list of numbers as a Unicode sparkline."""
+    if not values:
+        return ""
+    mn, mx = min(values), max(values)
+    if mn == mx:
+        return _SPARK[3] * len(values)
+    rng = mx - mn
+    return "".join(_SPARK[min(int((v - mn) / rng * 7), 7)] for v in values)
+
+
+def _parse_bucket(s):
+    """Parse bucket size (5m, 10m, 1h) to timedelta."""
+    m = re.match(r"^(\d+)([mhd])$", s)
+    if not m:
+        raise click.BadParameter(f"Bad bucket: {s} (use e.g. 5m, 1h)")
+    n, u = int(m.group(1)), m.group(2)
+    return {"m": timedelta(minutes=n), "h": timedelta(hours=n), "d": timedelta(days=n)}[
+        u
+    ]
+
+
+def _make_buckets(data, bucket_delta):
+    """Split [(datetime, ms)] into aligned time buckets.
+
+    Returns [(label, sorted_durs)] sorted by time, including empty buckets.
+    """
+    if not data:
+        return []
+    bsec = bucket_delta.total_seconds()
+    min_ts = min(ts for ts, _ in data)
+    max_ts = max(ts for ts, _ in data)
+
+    # Align to bucket boundary
+    start_epoch = (min_ts.timestamp() // bsec) * bsec
+    max_idx = int((max_ts.timestamp() - start_epoch) // bsec)
+
+    bins = defaultdict(list)
+    for ts, dur in data:
+        idx = int((ts.timestamp() - start_epoch) // bsec)
+        bins[idx].append(dur)
+
+    result = []
+    for idx in range(max_idx + 1):
+        t = datetime.fromtimestamp(start_epoch + idx * bsec, tz=timezone.utc)
+        t_end = t + bucket_delta
+        label = f"{t.strftime('%H:%M')}-{t_end.strftime('%H:%M')}"
+        durs = sorted(bins.get(idx, []))
+        result.append((label, durs))
+    return result
+
+
+def _trend(data, n_buckets=12):
+    """Compute p50 sparkline with range indicator from [(datetime, ms)]."""
+    if len(data) < 2:
+        return ""
+    min_ts = min(ts for ts, _ in data)
+    max_ts = max(ts for ts, _ in data)
+    span_secs = (max_ts - min_ts).total_seconds()
+    if span_secs <= 0:
+        return ""
+    bucket_secs = span_secs / n_buckets
+    buckets = [[] for _ in range(n_buckets)]
+    for ts, dur in data:
+        idx = min(int((ts - min_ts).total_seconds() / bucket_secs), n_buckets - 1)
+        buckets[idx].append(dur)
+    p50s = []
+    for b in buckets:
+        if b:
+            b.sort()
+            p50s.append(b[len(b) // 2])
+        else:
+            p50s.append(0)
+    spark = _sparkline(p50s)
+    real = [v for v in p50s if v > 0]
+    if real:
+        return f"{spark} {_fmt_ms(min(real))}-{_fmt_ms(max(real))}"
+    return spark
 
 
 # ── Rendering ────────────────────────────────────────────────────────────────
@@ -552,15 +630,24 @@ def cli(ctx, project, as_json):
     help="Start time (1h, 30m, 2d, or RFC3339)",
 )
 @click.option("--end", default=None, help="End time (default: now)")
-@click.option("--limit", default=20, show_default=True, type=int, help="Max traces")
+@click.option(
+    "--limit", default=20, show_default=True, type=int, help="Max traces to fetch"
+)
+@click.option(
+    "--service", "services", multiple=True, help="Filter by service.name (repeatable)"
+)
+@click.option("--label", "labels", multiple=True, help="Label key=value (repeatable)")
 @click.option("--min-latency", default=None, help="Min latency (500ms, 1s)")
 @click.option("--max-latency", default=None, help="Max latency (500ms, 1s)")
 @click.pass_context
-def list_cmd(ctx, start, end, limit, min_latency, max_latency):
+def list_cmd(ctx, start, end, limit, services, labels, min_latency, max_latency):
     """List recent traces."""
     p = ctx.obj["project"]
-    _, max_ms = parse_latency(max_latency)
-    params = _build_params(start, end, limit, min_latency=min_latency)
+    label_dict = _parse_labels(labels)
+    _, max_ms = _parse_latency(max_latency)
+    params = _build_params(
+        start, end, limit, min_latency=min_latency, services=services, labels=label_dict
+    )
     traces = fetch_traces(p, params, max_results=limit)
     if max_ms is not None:
         traces = filter_traces(traces, max_ms=max_ms)
@@ -579,7 +666,7 @@ def list_cmd(ctx, start, end, limit, min_latency, max_latency):
 )
 @click.option("--end", default=None, help="End time (default: now)")
 @click.option(
-    "--limit", default=200, show_default=True, type=int, help="Traces to scan"
+    "--limit", default=200, show_default=True, type=int, help="Max traces to fetch"
 )
 @click.pass_context
 def services(ctx, start, end, limit):
@@ -630,35 +717,23 @@ def services(ctx, start, end, limit):
 )
 @click.option("--end", default=None, help="End time (default: now)")
 @click.option(
-    "--limit", default=20, show_default=True, type=int, help="Traces to fetch in full"
+    "--limit", default=20, show_default=True, type=int, help="Max traces to fetch"
 )
 @click.option(
-    "--service", "service", multiple=True, help="Filter by service.name (repeatable)"
+    "--service", "services", multiple=True, help="Filter by service.name (repeatable)"
 )
 @click.option("--min-latency", default=None, help="Min latency (500ms, 1s)")
 @click.option("--max-latency", default=None, help="Max latency (500ms, 1s)")
 @click.pass_context
-def spans(ctx, start, end, limit, service, min_latency, max_latency):
+def spans(ctx, start, end, limit, services, min_latency, max_latency):
     """List distinct span names from sampled traces."""
     p = ctx.obj["project"]
-    _, max_ms = parse_latency(max_latency)
-    params = _build_params(start, end, limit, view="COMPLETE", min_latency=min_latency)
+    _, max_ms = _parse_latency(max_latency)
+    params = _build_params(
+        start, end, limit, view="COMPLETE", min_latency=min_latency, services=services
+    )
     traces = fetch_traces(p, params, max_results=limit)
-    if max_ms is not None:
-        traces = filter_traces(traces, max_ms=max_ms)
-
-    # Filter by service across ALL spans (not just root), because this command
-    # is about discovering span names within a service, not root-span ownership.
-    if service:
-        svc_set = set(service)
-        traces = [
-            t
-            for t in traces
-            if any(
-                s.get("labels", {}).get("service.name") in svc_set
-                for s in t.get("spans", [])
-            )
-        ]
+    traces = filter_traces(traces, services=services, max_ms=max_ms)
 
     if not traces:
         click.echo("No traces found.")
@@ -709,14 +784,14 @@ def get(ctx, trace_id, bars, name_width):
 )
 @click.option("--end", default=None, help="End time (default: now)")
 @click.option(
-    "--limit", default=50, show_default=True, type=int, help="Max traces to scan"
+    "--limit", default=50, show_default=True, type=int, help="Max traces to fetch"
 )
-@click.option("--span-name", default=None, help="Root span name (exact match)")
+@click.option("--span-name", default=None, help="Root span name (substring match)")
 @click.option("--label", "labels", multiple=True, help="Label key=value (repeatable)")
 @click.option("--min-latency", default=None, help="Min latency (500ms, 1s)")
 @click.option("--max-latency", default=None, help="Max latency (500ms, 1s)")
 @click.option(
-    "--service", "service", multiple=True, help="Filter by service.name (repeatable)"
+    "--service", "services", multiple=True, help="Filter by service.name (repeatable)"
 )
 @click.option(
     "--parent-span-id",
@@ -749,7 +824,7 @@ def search(
     labels,
     min_latency,
     max_latency,
-    service,
+    services,
     parent_span_id,
     show_labels,
     field_str,
@@ -770,8 +845,8 @@ def search(
     p = ctx.obj["project"]
     label_dict = _parse_labels(labels)
     fields = _parse_fields(field_str)
-    _, min_ms = parse_latency(min_latency)
-    _, max_ms = parse_latency(max_latency)
+    _, min_ms = _parse_latency(min_latency)
+    _, max_ms = _parse_latency(max_latency)
     view = "COMPLETE" if parent_span_id else "ROOTSPAN"
     params = _build_params(
         start,
@@ -779,7 +854,7 @@ def search(
         limit,
         view=view,
         min_latency=min_latency,
-        services=service,
+        services=services,
         labels=label_dict,
     )
     traces = fetch_traces(p, params, max_results=limit)
@@ -914,7 +989,7 @@ def _compare_services(
             click.echo(f"  No traces found for {compare_svc}.")
         return comparison
 
-    cmp_pvals = _percentiles(cmp_durations)
+    cmp_pvals = _pcts([ms for ms, _ in cmp_durations])
     cmp_n = len(cmp_durations)
     comparison["distribution"] = {
         "count": cmp_n,
@@ -1007,9 +1082,11 @@ def _compare_services(
     help="Start time (1h, 30m, 2d, or RFC3339)",
 )
 @click.option("--end", default=None, help="End time (default: now)")
-@click.option("--limit", default=50, show_default=True, type=int, help="Traces to scan")
 @click.option(
-    "--service", "service", multiple=True, help="Filter by service.name (repeatable)"
+    "--limit", default=50, show_default=True, type=int, help="Max traces to fetch"
+)
+@click.option(
+    "--service", "services", multiple=True, help="Filter by service.name (repeatable)"
 )
 @click.option("--label", "labels", multiple=True, help="Label key=value (repeatable)")
 @click.option("--min-latency", default=None, help="Min latency (500ms, 1s)")
@@ -1033,7 +1110,7 @@ def outliers(
     start,
     end,
     limit,
-    service,
+    services,
     labels,
     min_latency,
     max_latency,
@@ -1054,14 +1131,14 @@ def outliers(
     p = ctx.obj["project"]
     as_json = ctx.obj["json"]
     label_dict = _parse_labels(labels)
-    _, max_ms = parse_latency(max_latency)
+    _, max_ms = _parse_latency(max_latency)
     params = _build_params(
         start,
         end,
         limit,
         view="COMPLETE",
         min_latency=min_latency,
-        services=service,
+        services=services,
         labels=label_dict,
     )
 
@@ -1073,7 +1150,7 @@ def outliers(
         click.echo("No traces found.")
         return
 
-    pvals = _percentiles(durations)
+    pvals = _pcts([ms for ms, _ in durations])
     n = len(durations)
 
     if not as_json:
@@ -1140,7 +1217,7 @@ def outliers(
             click.echo(f"\n{'=' * 110}")
             click.echo(f"Comparing with: {compare_svc}\n")
 
-        svc_label = ", ".join(service) if service else "primary"
+        svc_label = ", ".join(services) if services else "primary"
         comparison = _compare_services(
             p,
             outlier_list,
@@ -1176,10 +1253,13 @@ def outliers(
 )
 @click.option("--end", default=None, help="End time (default: now)")
 @click.option(
-    "--limit", default=100, show_default=True, type=int, help="Traces to scan"
+    "--limit", default=100, show_default=True, type=int, help="Max traces to fetch"
 )
 @click.option(
-    "--span", "span_pattern", default=None, help="Span name filter (substring match)"
+    "--span-name",
+    "span_pattern",
+    default=None,
+    help="Span name filter (substring match)",
 )
 @click.option(
     "--group-by",
@@ -1188,14 +1268,16 @@ def outliers(
     help="Comma-separated label keys to group by",
 )
 @click.option(
-    "--service", "service", multiple=True, help="Filter by service.name (repeatable)"
+    "--service", "services", multiple=True, help="Filter by service.name (repeatable)"
 )
 @click.option("--label", "labels", multiple=True, help="Label key=value (repeatable)")
+@click.option("--min-latency", default=None, help="Min latency (500ms, 1s)")
+@click.option("--max-latency", default=None, help="Max latency (500ms, 1s)")
 @click.option(
-    "--min-latency", default=None, help="Min latency filter on trace (500ms, 1s)"
+    "--bucket", "bucket_str", default=None, help="Time bucket size (e.g. 5m, 10m, 1h)"
 )
 @click.option(
-    "--max-latency", default=None, help="Max latency filter on trace (500ms, 1s)"
+    "--sparkline", "sparkline", is_flag=True, help="Show p50 trend sparkline per group"
 )
 @click.pass_context
 def stats(
@@ -1205,10 +1287,12 @@ def stats(
     limit,
     span_pattern,
     group_by,
-    service,
+    services,
     labels,
     min_latency,
     max_latency,
+    bucket_str,
+    sparkline,
 ):
     """Latency stats, optionally grouped by span labels.
 
@@ -1217,15 +1301,18 @@ def stats(
 
     \b
     Examples:
-      gct stats --span "POST /v1/rtb" --group-by cloud.region
-      gct stats --span HTTP --group-by cloud.region,service.name
+      gct stats --span-name "POST /v1/rtb" --group-by cloud.region
+      gct stats --span-name HTTP --group-by cloud.region,service.name
       gct stats --service my-service --group-by abtest
+      gct stats --service my-service --bucket 5m
+      gct stats --service my-service --group-by abtest --sparkline
     """
     p = ctx.obj["project"]
     as_json = ctx.obj["json"]
     label_dict = _parse_labels(labels)
-    _, max_ms = parse_latency(max_latency)
+    _, max_ms = _parse_latency(max_latency)
     group_keys = [k.strip() for k in group_by.split(",")] if group_by else []
+    bucket_delta = _parse_bucket(bucket_str) if bucket_str else None
 
     params = _build_params(
         start,
@@ -1233,7 +1320,7 @@ def stats(
         limit,
         view="COMPLETE",
         min_latency=min_latency,
-        services=service,
+        services=services,
         labels=label_dict,
     )
     all_traces = fetch_traces(p, params, max_results=limit)
@@ -1243,7 +1330,7 @@ def stats(
         click.echo("No traces found.")
         return
 
-    # Collect matching spans into groups
+    # Collect matching spans into groups as (timestamp, duration) pairs
     groups = defaultdict(list)
     total_spans = 0
 
@@ -1252,27 +1339,26 @@ def stats(
             if span_pattern and span_pattern not in s.get("name", ""):
                 continue
             total_spans += 1
+            span_ts = _ts(s["startTime"])
             dur = _dur(s)
             if group_keys:
                 lbl = s.get("labels", {})
                 key = tuple(lbl.get(k, "") for k in group_keys)
-                groups[key].append(dur)
+                groups[key].append((span_ts, dur))
             else:
-                groups[()].append(dur)
+                groups[()].append((span_ts, dur))
 
     if not total_spans:
         click.echo("No spans matched.")
         return
-
-    for durs in groups.values():
-        durs.sort()
 
     sorted_groups = sorted(groups.items(), key=lambda x: -len(x[1]))
 
     # ── JSON output ──────────────────────────────────────────────────────
     if as_json:
         json_groups = []
-        for key, durs in sorted_groups:
+        for key, data in sorted_groups:
+            durs = sorted(d for _, d in data)
             entry = {
                 "count": len(durs),
                 "avgMs": round(sum(durs) / len(durs), 1),
@@ -1280,16 +1366,39 @@ def stats(
             }
             if group_keys:
                 entry["key"] = dict(zip(group_keys, key))
+            if bucket_delta:
+                bkts = _make_buckets(data, bucket_delta)
+                entry["buckets"] = [
+                    {
+                        "time": lbl,
+                        "count": len(bd),
+                        "avgMs": round(sum(bd) / len(bd), 1) if bd else None,
+                        "percentiles": (
+                            {k: round(v, 1) for k, v in _pcts(bd).items()}
+                            if bd
+                            else None
+                        ),
+                    }
+                    for lbl, bd in bkts
+                ]
+            if sparkline:
+                trend_vals = _trend(data)
+                if trend_vals:
+                    entry["trend"] = trend_vals
             json_groups.append(entry)
         out = {
             "totalSpans": total_spans,
             "totalTraces": len(filtered),
-            "groups": json_groups,
         }
         if span_pattern:
             out["span"] = span_pattern
         if group_keys:
             out["groupBy"] = group_keys
+            out["groups"] = json_groups
+        elif len(json_groups) == 1:
+            out.update(json_groups[0])
+        if bucket_str:
+            out["bucket"] = bucket_str
         click.echo(json.dumps(out, indent=2))
         return
 
@@ -1300,37 +1409,87 @@ def stats(
     click.echo(desc)
     click.echo()
 
+    # ── Bucket mode ──────────────────────────────────────────────────────
+    if bucket_delta:
+        for gi, (key, data) in enumerate(sorted_groups):
+            if group_keys:
+                label = " ".join(
+                    f"{k}={v or '(none)'}" for k, v in zip(group_keys, key)
+                )
+                click.echo(f"\u2500\u2500 {label} ({len(data)} spans) \u2500\u2500")
+                click.echo()
+
+            bkts = _make_buckets(data, bucket_delta)
+            click.echo(
+                f"{'TIME':<13}  {'COUNT':>6}  "
+                f"{'avg':>10}  {'p50':>10}  {'p90':>10}  {'p95':>10}  {'p99':>10}"
+            )
+            click.echo("\u2500" * 81)
+
+            for lbl, bd in bkts:
+                if bd:
+                    avg = sum(bd) / len(bd)
+                    pv = _pcts(bd)
+                    click.echo(
+                        f"{lbl:<13}  {len(bd):>6}  "
+                        f"{_fmt_ms(avg):>10}  {_fmt_ms(pv['p50']):>10}  "
+                        f"{_fmt_ms(pv['p90']):>10}  {_fmt_ms(pv['p95']):>10}  "
+                        f"{_fmt_ms(pv['p99']):>10}"
+                    )
+                else:
+                    click.echo(
+                        f"{lbl:<13}  {'0':>6}  "
+                        f"{'-':>10}  {'-':>10}  {'-':>10}  {'-':>10}  {'-':>10}"
+                    )
+
+            if gi < len(sorted_groups) - 1:
+                click.echo()
+        click.echo()
+        return
+
+    # ── Summary mode (with optional sparkline) ───────────────────────────
     if group_keys:
         rows = []
-        for key, durs in sorted_groups:
+        for key, data in sorted_groups:
             label = " ".join(f"{k}={v or '(none)'}" for k, v in zip(group_keys, key))
-            rows.append((label, durs))
+            durs = sorted(d for _, d in data)
+            trend_str = _trend(data) if sparkline else ""
+            rows.append((label, durs, trend_str))
 
         max_lbl = max(len(r[0]) for r in rows)
         max_lbl = max(max_lbl, 5)
 
-        click.echo(
+        hdr = (
             f"{'GROUP':<{max_lbl}}  {'COUNT':>6}  "
             f"{'avg':>10}  {'p50':>10}  {'p90':>10}  {'p95':>10}  {'p99':>10}"
         )
-        click.echo("\u2500" * (max_lbl + 68))
+        if sparkline:
+            hdr += "  TREND"
+        click.echo(hdr)
+        click.echo("\u2500" * (max_lbl + 68 + (30 if sparkline else 0)))
 
-        for label, durs in rows:
+        for label, durs, trend_str in rows:
             avg = sum(durs) / len(durs)
             pv = _pcts(durs)
-            click.echo(
+            line = (
                 f"{label:<{max_lbl}}  {len(durs):>6}  "
                 f"{_fmt_ms(avg):>10}  {_fmt_ms(pv['p50']):>10}  "
                 f"{_fmt_ms(pv['p90']):>10}  {_fmt_ms(pv['p95']):>10}  "
                 f"{_fmt_ms(pv['p99']):>10}"
             )
+            if trend_str:
+                line += f"  {trend_str}"
+            click.echo(line)
     else:
-        durs = sorted_groups[0][1]
+        data = sorted_groups[0][1]
+        durs = sorted(d for _, d in data)
         avg = sum(durs) / len(durs)
         pv = _pcts(durs)
         click.echo(f"  avg  {_fmt_ms(avg)}")
         for label, ms in pv.items():
             click.echo(f"  {label}  {_fmt_ms(ms)}")
+        if sparkline:
+            click.echo(f"\n  trend  {_trend(data)}")
 
     click.echo()
 
