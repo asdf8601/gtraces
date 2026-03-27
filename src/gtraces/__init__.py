@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-"""gct - CLI for GCP Cloud Trace API v1."""
+"""gct - CLI for GCP Cloud Trace API v1.
 
+Also importable as a library:
+
+    import gtraces
+    gtraces.set_token("my-token")          # or monkey-patch get_token
+    traces = gtraces.trace_list("my-project", start="1h")
+"""
+
+import functools
 import json
 import os
 import re
@@ -14,6 +22,21 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import click
+
+__all__ = [
+    "trace_list",
+    "trace_services",
+    "trace_spans",
+    "trace_get",
+    "trace_search",
+    "trace_outliers",
+    "trace_stats",
+    "get_token",
+    "set_token",
+    "fetch_traces",
+    "filter_traces",
+    "ApiError",
+]
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -77,6 +100,16 @@ def get_token():
         )
     except subprocess.CalledProcessError:
         raise ApiError("Auth failed. Run: gcloud auth login")
+
+
+def set_token(tok):
+    """Set the auth token directly, bypassing gcloud CLI.
+
+    Convenience for library consumers who obtain tokens externally
+    (e.g. via google-auth ADC).
+    """
+    global _token
+    _token = tok
 
 
 def api_get(project, path, params=None):
@@ -166,7 +199,7 @@ def _parse_latency(s):
         return None, None
     m = re.match(r"^(\d+(?:\.\d+)?)(ms|s)$", s)
     if not m:
-        raise click.BadParameter(f"Bad latency: {s} (use e.g. 500ms, 1s)")
+        raise ValueError(f"Bad latency: {s} (use e.g. 500ms, 1s)")
     val, unit = float(m.group(1)), m.group(2)
     ms = val if unit == "ms" else val * 1000
     return f"{m.group(1)}{m.group(2)}", ms
@@ -260,7 +293,7 @@ def _resolve_threshold(threshold, pvals):
         return pvals[threshold]
     _, ms = _parse_latency(threshold)
     if ms is None:
-        raise click.BadParameter(
+        raise ValueError(
             f"Bad threshold: {threshold} (use p50/p90/p95/p99 or e.g. 500ms)"
         )
     return ms
@@ -273,6 +306,19 @@ def _pcts(values):
         return {"p50": 0, "p90": 0, "p95": 0, "p99": 0}
     targets = {"p50": 0.50, "p90": 0.90, "p95": 0.95, "p99": 0.99}
     return {k: values[min(int(v * n), n - 1)] for k, v in targets.items()}
+
+
+def _cli_validate(fn):
+    """Decorator: convert ValueError to click.BadParameter in CLI commands."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ValueError as e:
+            raise click.BadParameter(str(e))
+
+    return wrapper
 
 
 # ── Timeseries helpers ───────────────────────────────────────────────────────
@@ -295,7 +341,7 @@ def _parse_bucket(s):
     """Parse bucket size (5m, 10m, 1h) to timedelta."""
     m = re.match(r"^(\d+)([mhd])$", s)
     if not m:
-        raise click.BadParameter(f"Bad bucket: {s} (use e.g. 5m, 1h)")
+        raise ValueError(f"Bad bucket: {s} (use e.g. 5m, 1h)")
     n, u = int(m.group(1)), m.group(2)
     return {"m": timedelta(minutes=n), "h": timedelta(hours=n), "d": timedelta(days=n)}[
         u
@@ -601,6 +647,393 @@ def render_timeline(trace):
         click.echo(f"  {name:<55} {_fmt_ms(d):>10}  ({pct:.0f}%)")
 
 
+def _render_comparison(comparison, primary_pvals, services):
+    """Render cross-service comparison text from structured data."""
+    compare_svc = comparison["service"]
+    primary_label = ", ".join(services) if services else "primary"
+    dist = comparison.get("distribution")
+
+    if not dist:
+        click.echo(f"  No traces found for {compare_svc}.")
+        return
+
+    cmp_pvals = dist["percentiles"]
+    cmp_n = dist["count"]
+
+    click.echo(f"  {compare_svc} latency ({cmp_n} traces):\n")
+    click.echo(f"  {'PCTL':<6} {primary_label:<30} {compare_svc}")
+    click.echo(f"  {'─' * 70}")
+    for label in ("p50", "p90", "p95", "p99"):
+        click.echo(
+            f"  {label:<6} {_fmt_ms(primary_pvals[label]):<30} "
+            f"{_fmt_ms(cmp_pvals[label])}"
+        )
+
+    click.echo("\n  During outlier windows:")
+    click.echo(
+        f"  {'#':<3} {'TIME':<26} "
+        f"{primary_label + ' latency':<25} {compare_svc + ' latency'}"
+    )
+    click.echo(f"  {'─' * 80}")
+
+    for i, w in enumerate(comparison.get("windows", []), 1):
+        if "avgMs" in w:
+            cmp_str = (
+                f"avg {_fmt_ms(w['avgMs'])}, max {_fmt_ms(w['maxMs'])} "
+                f"({w['count']} traces)"
+            )
+        else:
+            cmp_str = "(no traces)"
+        click.echo(f"  {i:<3} {w['time']:<26} {_fmt_ms(w['primaryMs']):<25} {cmp_str}")
+
+
+# ── Programmatic API ─────────────────────────────────────────────────────────
+
+
+def trace_list(
+    project,
+    *,
+    start="1h",
+    end=None,
+    limit=20,
+    services=(),
+    labels=None,
+    min_latency=None,
+    max_latency=None,
+):
+    """Fetch and filter recent traces. Returns list of trace dicts."""
+    _, max_ms = _parse_latency(max_latency)
+    params = _build_params(
+        start, end, limit, min_latency=min_latency, services=services, labels=labels
+    )
+    traces = fetch_traces(project, params, max_results=limit)
+    if max_ms is not None:
+        traces = filter_traces(traces, max_ms=max_ms)
+    return traces
+
+
+def trace_get(project, trace_id):
+    """Fetch a single trace by ID. Returns trace dict."""
+    return api_get(project, f"/traces/{trace_id}")
+
+
+def trace_services(project, *, start="3h", end=None, limit=200):
+    """Collect service and endpoint counts.
+
+    Returns {services: dict, endpoints: dict, trace_count: int}.
+    """
+    params = _build_params(start, end, limit)
+    traces = fetch_traces(project, params, max_results=limit)
+    if not traces:
+        return {"services": {}, "endpoints": {}, "trace_count": 0}
+    svc_counts = Counter()
+    ep_counts = Counter()
+    for t in traces:
+        for s in t.get("spans", []):
+            svc = s.get("labels", {}).get("service.name")
+            if svc:
+                svc_counts[svc] += 1
+            if not s.get("parentSpanId"):
+                ep_counts[s.get("name", "?")] += 1
+    return {
+        "services": dict(svc_counts),
+        "endpoints": dict(ep_counts),
+        "trace_count": len(traces),
+    }
+
+
+def trace_spans(
+    project,
+    *,
+    start="1h",
+    end=None,
+    limit=20,
+    services=(),
+    min_latency=None,
+    max_latency=None,
+):
+    """Collect distinct span name counts. Returns dict[str, int] (name->count)."""
+    _, max_ms = _parse_latency(max_latency)
+    params = _build_params(
+        start, end, limit, view="COMPLETE", min_latency=min_latency, services=services
+    )
+    traces = fetch_traces(project, params, max_results=limit)
+    traces = filter_traces(traces, services=services, max_ms=max_ms)
+    span_counts = Counter()
+    for t in traces:
+        for s in t.get("spans", []):
+            span_counts[s.get("name", "?")] += 1
+    return dict(span_counts.most_common())
+
+
+def trace_search(
+    project,
+    *,
+    start="1h",
+    end=None,
+    limit=50,
+    span_name=None,
+    labels=None,
+    min_latency=None,
+    max_latency=None,
+    services=(),
+    parent_span_id=None,
+    order_asc=None,
+    order_desc=None,
+):
+    """Search traces with client-side filtering.
+
+    Without parent_span_id: returns list of trace dicts.
+    With parent_span_id: returns list of {traceId, spans} dicts containing
+    only the spans matching that parent.
+    """
+    if order_asc and order_desc:
+        raise ValueError("Cannot use both order_asc and order_desc")
+    _, min_ms = _parse_latency(min_latency)
+    _, max_ms = _parse_latency(max_latency)
+    view = "COMPLETE" if parent_span_id else "ROOTSPAN"
+    params = _build_params(
+        start,
+        end,
+        limit,
+        view=view,
+        min_latency=min_latency,
+        services=services,
+        labels=labels,
+    )
+    traces = fetch_traces(project, params, max_results=limit)
+
+    if not parent_span_id:
+        filtered = filter_traces(
+            traces,
+            span_name=span_name,
+            min_ms=min_ms,
+            max_ms=max_ms,
+        )
+        if order_asc or order_desc:
+            reverse = order_desc is not None
+            filtered.sort(
+                key=lambda t: _dur(_root(t.get("spans", [])) or {}),
+                reverse=reverse,
+            )
+        return filtered
+
+    matches = []
+    for t in traces:
+        matched_spans = [
+            s
+            for s in t.get("spans", [])
+            if s.get("parentSpanId") == parent_span_id
+            and (not span_name or s.get("name") == span_name)
+        ]
+        if matched_spans:
+            matches.append({"traceId": t["traceId"], "spans": matched_spans})
+    return matches
+
+
+def trace_outliers(
+    project,
+    *,
+    start="1h",
+    end=None,
+    limit=50,
+    services=(),
+    labels=None,
+    min_latency=None,
+    max_latency=None,
+    threshold="p95",
+    top=5,
+    compare_svc=None,
+):
+    """Find outlier traces with per-span breakdown. Always returns a dict.
+
+    Keys: distribution, count, threshold, thresholdMs, outliers.
+    Optional: comparison (when compare_svc is given).
+    """
+    _, max_ms = _parse_latency(max_latency)
+    params = _build_params(
+        start,
+        end,
+        limit,
+        view="COMPLETE",
+        min_latency=min_latency,
+        services=services,
+        labels=labels,
+    )
+    all_traces = fetch_traces(project, params, max_results=limit)
+    filtered = filter_traces(all_traces, max_ms=max_ms)
+    durations = _to_durations(filtered)
+
+    if not durations:
+        return {
+            "distribution": {"p50": 0, "p90": 0, "p95": 0, "p99": 0},
+            "count": 0,
+            "threshold": threshold,
+            "thresholdMs": 0,
+            "outliers": [],
+        }
+
+    pvals = _pcts([ms for ms, _ in durations])
+    n = len(durations)
+    thresh_ms = _resolve_threshold(threshold, pvals)
+    outlier_list = [(ms, t) for ms, t in durations if ms >= thresh_ms]
+    outlier_list.sort(key=lambda x: -x[0])
+    outlier_list = outlier_list[:top]
+
+    json_out = []
+    for total_ms, t in outlier_list:
+        tid = t.get("traceId")
+        span_self = _span_breakdown(t.get("spans", []))
+        total_self = sum(ms for _, ms in span_self) or 1
+        json_out.append(
+            {
+                "traceId": tid,
+                "totalMs": round(total_ms, 1),
+                "totalSelfMs": round(total_self, 1),
+                "spans": [
+                    {
+                        "name": name,
+                        "selfMs": round(ms, 1),
+                        "pct": round(ms / total_self * 100),
+                    }
+                    for name, ms in span_self[:8]
+                ],
+            }
+        )
+
+    result = {
+        "distribution": {k: round(v, 1) for k, v in pvals.items()},
+        "count": n,
+        "threshold": threshold,
+        "thresholdMs": round(thresh_ms, 1),
+        "outliers": json_out,
+    }
+
+    if compare_svc:
+        svc_label = ", ".join(services) if services else "primary"
+        comparison = _compare_services(
+            project,
+            outlier_list,
+            all_traces,
+            compare_svc,
+            pvals,
+            svc_label,
+            True,
+        )
+        result["comparison"] = comparison
+
+    return result
+
+
+def trace_stats(
+    project,
+    *,
+    start="1h",
+    end=None,
+    limit=100,
+    span_pattern=None,
+    group_by=None,
+    services=(),
+    labels=None,
+    min_latency=None,
+    max_latency=None,
+    bucket=None,
+    sparkline=False,
+):
+    """Compute latency stats, optionally grouped by span labels.
+
+    Parameters:
+      group_by   — list of label keys to group by, or None
+      labels     — dict of label filters, or None
+      bucket     — bucket size string (e.g. '5m', '1h'), or None
+      sparkline  — include trend data per group
+
+    Returns dict with totalSpans, totalTraces, and group data.
+    Returns empty dict when no traces found.
+    """
+    _, max_ms = _parse_latency(max_latency)
+    group_keys = list(group_by) if group_by else []
+    bucket_delta = _parse_bucket(bucket) if bucket else None
+
+    params = _build_params(
+        start,
+        end,
+        limit,
+        view="COMPLETE",
+        min_latency=min_latency,
+        services=services,
+        labels=labels,
+    )
+    all_traces = fetch_traces(project, params, max_results=limit)
+    filtered = filter_traces(all_traces, max_ms=max_ms)
+
+    if not filtered:
+        return {}
+
+    groups = defaultdict(list)
+    total_spans = 0
+
+    for t in filtered:
+        for s in t.get("spans", []):
+            if span_pattern and span_pattern not in s.get("name", ""):
+                continue
+            total_spans += 1
+            span_ts = _ts(s["startTime"])
+            dur = _dur(s)
+            if group_keys:
+                lbl = s.get("labels", {})
+                key = tuple(lbl.get(k, "") for k in group_keys)
+                groups[key].append((span_ts, dur))
+            else:
+                groups[()].append((span_ts, dur))
+
+    if not total_spans:
+        return {"totalSpans": 0, "totalTraces": len(filtered)}
+
+    sorted_groups = sorted(groups.items(), key=lambda x: -len(x[1]))
+
+    json_groups = []
+    for key, data in sorted_groups:
+        durs = sorted(d for _, d in data)
+        entry = {
+            "count": len(durs),
+            "avgMs": round(sum(durs) / len(durs), 1),
+            "percentiles": {k: round(v, 1) for k, v in _pcts(durs).items()},
+        }
+        if group_keys:
+            entry["key"] = dict(zip(group_keys, key))
+        if bucket_delta:
+            bkts = _make_buckets(data, bucket_delta)
+            entry["buckets"] = [
+                {
+                    "time": lbl,
+                    "count": len(bd),
+                    "avgMs": round(sum(bd) / len(bd), 1) if bd else None,
+                    "percentiles": (
+                        {k: round(v, 1) for k, v in _pcts(bd).items()} if bd else None
+                    ),
+                }
+                for lbl, bd in bkts
+            ]
+        if sparkline:
+            trend_vals = _trend(data)
+            if trend_vals:
+                entry["trend"] = trend_vals
+        json_groups.append(entry)
+
+    out = {"totalSpans": total_spans, "totalTraces": len(filtered)}
+    if span_pattern:
+        out["span"] = span_pattern
+    if group_keys:
+        out["groupBy"] = group_keys
+        out["groups"] = json_groups
+    elif len(json_groups) == 1:
+        out.update(json_groups[0])
+    if bucket:
+        out["bucket"] = bucket
+    return out
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
@@ -640,17 +1073,20 @@ def cli(ctx, project, as_json):
 @click.option("--min-latency", default=None, help="Min latency (500ms, 1s)")
 @click.option("--max-latency", default=None, help="Max latency (500ms, 1s)")
 @click.pass_context
+@_cli_validate
 def list_cmd(ctx, start, end, limit, services, labels, min_latency, max_latency):
     """List recent traces."""
-    p = ctx.obj["project"]
     label_dict = _parse_labels(labels)
-    _, max_ms = _parse_latency(max_latency)
-    params = _build_params(
-        start, end, limit, min_latency=min_latency, services=services, labels=label_dict
+    traces = trace_list(
+        ctx.obj["project"],
+        start=start,
+        end=end,
+        limit=limit,
+        services=services,
+        labels=label_dict,
+        min_latency=min_latency,
+        max_latency=max_latency,
     )
-    traces = fetch_traces(p, params, max_results=limit)
-    if max_ms is not None:
-        traces = filter_traces(traces, max_ms=max_ms)
     if ctx.obj["json"]:
         click.echo(json.dumps(traces, indent=2))
     else:
@@ -669,33 +1105,21 @@ def list_cmd(ctx, start, end, limit, services, labels, min_latency, max_latency)
     "--limit", default=200, show_default=True, type=int, help="Max traces to fetch"
 )
 @click.pass_context
+@_cli_validate
 def services(ctx, start, end, limit):
     """List services and endpoints seen in recent traces."""
-    p = ctx.obj["project"]
-    params = _build_params(start, end, limit)
-    traces = fetch_traces(p, params, max_results=limit)
-    if not traces:
+    result = trace_services(ctx.obj["project"], start=start, end=end, limit=limit)
+    if not result["services"] and not result["endpoints"]:
         click.echo("No traces found.")
         return
 
-    svc_counts = Counter()
-    ep_counts = Counter()
-    for t in traces:
-        for s in t.get("spans", []):
-            svc = s.get("labels", {}).get("service.name")
-            if svc:
-                svc_counts[svc] += 1
-            if not s.get("parentSpanId"):
-                ep_counts[s.get("name", "?")] += 1
-
     if ctx.obj["json"]:
-        click.echo(
-            json.dumps(
-                {"services": dict(svc_counts), "endpoints": dict(ep_counts)}, indent=2
-            )
-        )
+        out = {k: v for k, v in result.items() if k != "trace_count"}
+        click.echo(json.dumps(out, indent=2))
         return
 
+    svc_counts = Counter(result["services"])
+    ep_counts = Counter(result["endpoints"])
     click.echo(f"{'SERVICE':<45} TRACES")
     click.echo("\u2500" * 55)
     for svc, n in svc_counts.most_common():
@@ -705,7 +1129,7 @@ def services(ctx, start, end, limit):
     click.echo("\u2500" * 55)
     for ep, n in ep_counts.most_common():
         click.echo(f"  {ep:<45} {n}")
-    click.echo(f"\nScanned {len(traces)} traces from last {start}.")
+    click.echo(f"\nScanned {result['trace_count']} traces from last {start}.")
 
 
 @cli.command()
@@ -725,6 +1149,7 @@ def services(ctx, start, end, limit):
 @click.option("--min-latency", default=None, help="Min latency (500ms, 1s)")
 @click.option("--max-latency", default=None, help="Max latency (500ms, 1s)")
 @click.pass_context
+@_cli_validate
 def spans(ctx, start, end, limit, services, min_latency, max_latency):
     """List distinct span names from sampled traces."""
     p = ctx.obj["project"]
@@ -766,9 +1191,10 @@ def spans(ctx, start, end, limit, services, min_latency, max_latency):
     help="Span name column width",
 )
 @click.pass_context
+@_cli_validate
 def get(ctx, trace_id, bars, name_width):
     """Show trace as a span tree."""
-    trace = api_get(ctx.obj["project"], f"/traces/{trace_id}")
+    trace = trace_get(ctx.obj["project"], trace_id)
     if ctx.obj["json"]:
         click.echo(json.dumps(trace, indent=2))
     else:
@@ -815,6 +1241,7 @@ def get(ctx, trace_id, bars, name_width):
     help="Sort descending",
 )
 @click.pass_context
+@_cli_validate
 def search(
     ctx,
     start,
@@ -845,75 +1272,44 @@ def search(
     p = ctx.obj["project"]
     label_dict = _parse_labels(labels)
     fields = _parse_fields(field_str)
-    _, min_ms = _parse_latency(min_latency)
-    _, max_ms = _parse_latency(max_latency)
-    view = "COMPLETE" if parent_span_id else "ROOTSPAN"
-    params = _build_params(
-        start,
-        end,
-        limit,
-        view=view,
-        min_latency=min_latency,
-        services=services,
-        labels=label_dict,
-    )
-    traces = fetch_traces(p, params, max_results=limit)
 
     if order_asc and order_desc:
         raise click.UsageError("Cannot use both --order-asc and --order-desc")
 
+    result = trace_search(
+        p,
+        start=start,
+        end=end,
+        limit=limit,
+        span_name=span_name,
+        labels=label_dict,
+        min_latency=min_latency,
+        max_latency=max_latency,
+        services=services,
+        parent_span_id=parent_span_id,
+        order_asc=order_asc,
+        order_desc=order_desc,
+    )
+
     if not parent_span_id:
-        # Client-side filters that can't be pushed server-side
-        filtered = filter_traces(
-            traces,
-            span_name=span_name,
-            min_ms=min_ms,
-            max_ms=max_ms,
-        )
-        if order_asc or order_desc:
-            reverse = order_desc is not None
-            filtered.sort(
-                key=lambda t: _dur(_root(t.get("spans", [])) or {}), reverse=reverse
-            )
         if ctx.obj["json"]:
-            click.echo(json.dumps(filtered, indent=2))
+            click.echo(json.dumps(result, indent=2))
         else:
-            render_list(filtered, show_labels=show_labels, fields=fields)
-            if traces:
-                click.echo(f"\n{len(filtered)}/{len(traces)} traces matched.")
+            render_list(result, show_labels=show_labels, fields=fields)
+            click.echo(f"\n{len(result)} traces matched.")
         return
 
-    # All spans already fetched via COMPLETE view — filter in-memory
-    matches = []
-    for t in traces:
-        matched_spans = [
-            s
-            for s in t.get("spans", [])
-            if s.get("parentSpanId") == parent_span_id
-            and (not span_name or s.get("name") == span_name)
-        ]
-        if matched_spans:
-            matches.append({"trace": t, "matched_spans": matched_spans})
-
-    if not matches:
+    if not result:
         click.echo("No spans matched.")
         return
 
     if ctx.obj["json"]:
-        click.echo(
-            json.dumps(
-                [
-                    {"traceId": m["trace"]["traceId"], "spans": m["matched_spans"]}
-                    for m in matches
-                ],
-                indent=2,
-            )
-        )
+        click.echo(json.dumps(result, indent=2))
         return
 
-    total_spans = sum(len(m["matched_spans"]) for m in matches)
+    total_spans = sum(len(m["spans"]) for m in result)
     click.echo(
-        f"Found {total_spans} span(s) in {len(matches)} trace(s) "
+        f"Found {total_spans} span(s) in {len(result)} trace(s) "
         f"with parentSpanId={parent_span_id}\n"
     )
     click.echo(
@@ -921,9 +1317,9 @@ def search(
         f"{'DURATION':>10}  {'SPAN ID':<20}  LABELS"
     )
     click.echo("\u2500" * 120)
-    for m in matches:
-        tid = m["trace"].get("traceId", "?")
-        for s in m["matched_spans"]:
+    for m in result:
+        tid = m.get("traceId", "?")
+        for s in m["spans"]:
             name = s.get("name", "?")[:40]
             dur = _fmt_ms(_dur(s))
             sid = s.get("spanId", "?")
@@ -936,9 +1332,10 @@ def search(
 @cli.command()
 @click.argument("trace_id")
 @click.pass_context
+@_cli_validate
 def analyze(ctx, trace_id):
     """Timeline analysis with bottleneck detection."""
-    trace = api_get(ctx.obj["project"], f"/traces/{trace_id}")
+    trace = trace_get(ctx.obj["project"], trace_id)
     if ctx.obj["json"]:
         click.echo(json.dumps(trace, indent=2))
     else:
@@ -1005,7 +1402,7 @@ def _compare_services(
                 f"  {label:<6} {_fmt_ms(primary_pvals[label]):<30} "
                 f"{_fmt_ms(cmp_pvals[label])}"
             )
-        click.echo(f"\n  During outlier windows:")
+        click.echo("\n  During outlier windows:")
         click.echo(
             f"  {'#':<3} {'TIME':<26} "
             f"{primary_label + ' latency':<25} {compare_svc + ' latency'}"
@@ -1105,6 +1502,7 @@ def _compare_services(
     help="Compare with another service in the same time window",
 )
 @click.pass_context
+@_cli_validate
 def outliers(
     ctx,
     start,
@@ -1131,114 +1529,73 @@ def outliers(
     p = ctx.obj["project"]
     as_json = ctx.obj["json"]
     label_dict = _parse_labels(labels)
-    _, max_ms = _parse_latency(max_latency)
-    params = _build_params(
-        start,
-        end,
-        limit,
-        view="COMPLETE",
-        min_latency=min_latency,
+
+    result = trace_outliers(
+        p,
+        start=start,
+        end=end,
+        limit=limit,
         services=services,
         labels=label_dict,
+        min_latency=min_latency,
+        max_latency=max_latency,
+        threshold=threshold,
+        top=top,
+        compare_svc=compare_svc,
     )
 
-    all_traces = fetch_traces(p, params, max_results=limit)
-    filtered = filter_traces(all_traces, max_ms=max_ms)
-    durations = _to_durations(filtered)
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+        return
 
-    if not durations:
+    # No traces
+    if result["count"] == 0:
         click.echo("No traces found.")
         return
 
-    pvals = _pcts([ms for ms, _ in durations])
-    n = len(durations)
+    # Distribution
+    pvals = result["distribution"]
+    click.echo(f"Latency distribution ({result['count']} traces):\n")
+    for label, ms in pvals.items():
+        click.echo(f"  {label}  {_fmt_ms(ms)}")
+    click.echo()
 
-    if not as_json:
-        click.echo(f"Latency distribution ({n} traces):\n")
-        for label, ms in pvals.items():
-            click.echo(f"  {label}  {_fmt_ms(ms)}")
-        click.echo()
-
-    thresh_ms = _resolve_threshold(threshold, pvals)
-    outlier_list = [(ms, t) for ms, t in durations if ms >= thresh_ms]
-    outlier_list.sort(key=lambda x: -x[0])
-    outlier_list = outlier_list[:top]
-
-    if not outlier_list:
-        click.echo(f"No outliers above {threshold} ({_fmt_ms(thresh_ms)}).")
+    if not result["outliers"]:
+        click.echo(
+            f"No outliers above {result['threshold']} "
+            f"({_fmt_ms(result['thresholdMs'])})."
+        )
         return
 
-    if not as_json:
+    # Outlier table
+    click.echo(
+        f"Outliers above {result['threshold']} "
+        f"({_fmt_ms(result['thresholdMs'])}): "
+        f"{len(result['outliers'])} shown\n"
+    )
+    click.echo(f"{'#':<3} {'TRACE ID':<36} {'TOTAL':>10}  TOP SPANS (self time)")
+    click.echo("\u2500" * 110)
+
+    for i, o in enumerate(result["outliers"], 1):
+        total_ms = o["totalMs"]
+        tid = o["traceId"]
+        total_self = o["totalSelfMs"] or 1
+        top_spans = o["spans"][:5]
+        first = top_spans[0]
+        first_pct = first["selfMs"] / total_self * 100
         click.echo(
-            f"Outliers above {threshold} ({_fmt_ms(thresh_ms)}): "
-            f"{len(outlier_list)} shown\n"
+            f"{i:<3} {tid:<36} {_fmt_ms(total_ms):>10}  "
+            f"{first['name']} {_fmt_ms(first['selfMs'])} ({first_pct:.0f}%)"
         )
-        click.echo(f"{'#':<3} {'TRACE ID':<36} {'TOTAL':>10}  TOP SPANS (self time)")
-        click.echo("\u2500" * 110)
+        for s in top_spans[1:]:
+            pct = s["selfMs"] / total_self * 100
+            click.echo(f"{'':>52}{s['name']} {_fmt_ms(s['selfMs'])} ({pct:.0f}%)")
 
-    # Per-outlier span breakdown
-    json_out = []
-    for i, (total_ms, t) in enumerate(outlier_list, 1):
-        tid = t.get("traceId")
-        span_self = _span_breakdown(t.get("spans", []))
-        total_self = sum(ms for _, ms in span_self) or 1
-
-        if as_json:
-            json_out.append(
-                {
-                    "traceId": tid,
-                    "totalMs": round(total_ms, 1),
-                    "spans": [
-                        {
-                            "name": name,
-                            "selfMs": round(ms, 1),
-                            "pct": round(ms / total_self * 100),
-                        }
-                        for name, ms in span_self[:8]
-                    ],
-                }
-            )
-        else:
-            top_spans = span_self[:5]
-            first_name, first_ms = top_spans[0]
-            first_pct = first_ms / total_self * 100
-            click.echo(
-                f"{i:<3} {tid:<36} {_fmt_ms(total_ms):>10}  "
-                f"{first_name} {_fmt_ms(first_ms)} ({first_pct:.0f}%)"
-            )
-            for name, ms in top_spans[1:]:
-                pct = ms / total_self * 100
-                click.echo(f"{'':>52}{name} {_fmt_ms(ms)} ({pct:.0f}%)")
-
-    # Cross-service comparison
-    comparison = None
-    if compare_svc:
-        if not as_json:
-            click.echo(f"\n{'=' * 110}")
-            click.echo(f"Comparing with: {compare_svc}\n")
-
-        svc_label = ", ".join(services) if services else "primary"
-        comparison = _compare_services(
-            p,
-            outlier_list,
-            all_traces,
-            compare_svc,
-            pvals,
-            svc_label,
-            as_json,
-        )
-
-    if as_json:
-        out = {
-            "distribution": {k: round(v, 1) for k, v in pvals.items()},
-            "count": n,
-            "threshold": threshold,
-            "thresholdMs": round(thresh_ms, 1),
-            "outliers": json_out,
-        }
-        if comparison:
-            out["comparison"] = comparison
-        click.echo(json.dumps(out, indent=2))
+    # Comparison
+    if result.get("comparison"):
+        click.echo(f"\n{'=' * 110}")
+        click.echo(f"Comparing with: {result['comparison']['service']}\n")
+        _render_comparison(result["comparison"], pvals, services)
 
 
 # ── Stats command ────────────────────────────────────────────────────────────
@@ -1280,6 +1637,7 @@ def outliers(
     "--sparkline", "sparkline", is_flag=True, help="Show p50 trend sparkline per group"
 )
 @click.pass_context
+@_cli_validate
 def stats(
     ctx,
     start,
@@ -1310,139 +1668,79 @@ def stats(
     p = ctx.obj["project"]
     as_json = ctx.obj["json"]
     label_dict = _parse_labels(labels)
-    _, max_ms = _parse_latency(max_latency)
     group_keys = [k.strip() for k in group_by.split(",")] if group_by else []
-    bucket_delta = _parse_bucket(bucket_str) if bucket_str else None
 
-    params = _build_params(
-        start,
-        end,
-        limit,
-        view="COMPLETE",
-        min_latency=min_latency,
+    result = trace_stats(
+        p,
+        start=start,
+        end=end,
+        limit=limit,
+        span_pattern=span_pattern,
+        group_by=group_keys or None,
         services=services,
         labels=label_dict,
+        min_latency=min_latency,
+        max_latency=max_latency,
+        bucket=bucket_str,
+        sparkline=sparkline,
     )
-    all_traces = fetch_traces(p, params, max_results=limit)
-    filtered = filter_traces(all_traces, max_ms=max_ms)
 
-    if not filtered:
+    if not result:
         click.echo("No traces found.")
         return
 
-    # Collect matching spans into groups as (timestamp, duration) pairs
-    groups = defaultdict(list)
-    total_spans = 0
-
-    for t in filtered:
-        for s in t.get("spans", []):
-            if span_pattern and span_pattern not in s.get("name", ""):
-                continue
-            total_spans += 1
-            span_ts = _ts(s["startTime"])
-            dur = _dur(s)
-            if group_keys:
-                lbl = s.get("labels", {})
-                key = tuple(lbl.get(k, "") for k in group_keys)
-                groups[key].append((span_ts, dur))
-            else:
-                groups[()].append((span_ts, dur))
-
-    if not total_spans:
+    if result.get("totalSpans", 0) == 0:
         click.echo("No spans matched.")
         return
 
-    sorted_groups = sorted(groups.items(), key=lambda x: -len(x[1]))
-
-    # ── JSON output ──────────────────────────────────────────────────────
     if as_json:
-        json_groups = []
-        for key, data in sorted_groups:
-            durs = sorted(d for _, d in data)
-            entry = {
-                "count": len(durs),
-                "avgMs": round(sum(durs) / len(durs), 1),
-                "percentiles": {k: round(v, 1) for k, v in _pcts(durs).items()},
-            }
-            if group_keys:
-                entry["key"] = dict(zip(group_keys, key))
-            if bucket_delta:
-                bkts = _make_buckets(data, bucket_delta)
-                entry["buckets"] = [
-                    {
-                        "time": lbl,
-                        "count": len(bd),
-                        "avgMs": round(sum(bd) / len(bd), 1) if bd else None,
-                        "percentiles": (
-                            {k: round(v, 1) for k, v in _pcts(bd).items()}
-                            if bd
-                            else None
-                        ),
-                    }
-                    for lbl, bd in bkts
-                ]
-            if sparkline:
-                trend_vals = _trend(data)
-                if trend_vals:
-                    entry["trend"] = trend_vals
-            json_groups.append(entry)
-        out = {
-            "totalSpans": total_spans,
-            "totalTraces": len(filtered),
-        }
-        if span_pattern:
-            out["span"] = span_pattern
-        if group_keys:
-            out["groupBy"] = group_keys
-            out["groups"] = json_groups
-        elif len(json_groups) == 1:
-            out.update(json_groups[0])
-        if bucket_str:
-            out["bucket"] = bucket_str
-        click.echo(json.dumps(out, indent=2))
+        click.echo(json.dumps(result, indent=2))
         return
 
     # ── Text output ──────────────────────────────────────────────────────
-    desc = f"Latency stats ({total_spans} spans across {len(filtered)} traces)"
+    total_spans = result["totalSpans"]
+    total_traces = result["totalTraces"]
+    desc = f"Latency stats ({total_spans} spans across {total_traces} traces)"
     if span_pattern:
         desc += f'  span ~ "{span_pattern}"'
     click.echo(desc)
     click.echo()
 
+    groups = result.get("groups", [result] if "percentiles" in result else [])
+
     # ── Bucket mode ──────────────────────────────────────────────────────
-    if bucket_delta:
-        for gi, (key, data) in enumerate(sorted_groups):
+    if bucket_str:
+        for gi, g in enumerate(groups):
             if group_keys:
+                key = g.get("key", {})
                 label = " ".join(
-                    f"{k}={v or '(none)'}" for k, v in zip(group_keys, key)
+                    f"{k}={key.get(k, '') or '(none)'}" for k in group_keys
                 )
-                click.echo(f"\u2500\u2500 {label} ({len(data)} spans) \u2500\u2500")
+                click.echo(f"\u2500\u2500 {label} ({g['count']} spans) \u2500\u2500")
                 click.echo()
 
-            bkts = _make_buckets(data, bucket_delta)
             click.echo(
                 f"{'TIME':<13}  {'COUNT':>6}  "
                 f"{'avg':>10}  {'p50':>10}  {'p90':>10}  {'p95':>10}  {'p99':>10}"
             )
             click.echo("\u2500" * 81)
 
-            for lbl, bd in bkts:
-                if bd:
-                    avg = sum(bd) / len(bd)
-                    pv = _pcts(bd)
+            for b in g.get("buckets", []):
+                if b["count"] > 0:
+                    pv = b["percentiles"]
                     click.echo(
-                        f"{lbl:<13}  {len(bd):>6}  "
-                        f"{_fmt_ms(avg):>10}  {_fmt_ms(pv['p50']):>10}  "
+                        f"{b['time']:<13}  {b['count']:>6}  "
+                        f"{_fmt_ms(b['avgMs']):>10}  {_fmt_ms(pv['p50']):>10}  "
                         f"{_fmt_ms(pv['p90']):>10}  {_fmt_ms(pv['p95']):>10}  "
                         f"{_fmt_ms(pv['p99']):>10}"
                     )
                 else:
                     click.echo(
-                        f"{lbl:<13}  {'0':>6}  "
+                        f"{b['time']:<13}  {'0':>6}  "
                         f"{'-':>10}  {'-':>10}  {'-':>10}  {'-':>10}  {'-':>10}"
                     )
 
-            if gi < len(sorted_groups) - 1:
+            if gi < len(groups) - 1:
                 click.echo()
         click.echo()
         return
@@ -1450,11 +1748,10 @@ def stats(
     # ── Summary mode (with optional sparkline) ───────────────────────────
     if group_keys:
         rows = []
-        for key, data in sorted_groups:
-            label = " ".join(f"{k}={v or '(none)'}" for k, v in zip(group_keys, key))
-            durs = sorted(d for _, d in data)
-            trend_str = _trend(data) if sparkline else ""
-            rows.append((label, durs, trend_str))
+        for g in groups:
+            key = g.get("key", {})
+            label = " ".join(f"{k}={key.get(k, '') or '(none)'}" for k in group_keys)
+            rows.append((label, g))
 
         max_lbl = max(len(r[0]) for r in rows)
         max_lbl = max(max_lbl, 5)
@@ -1468,28 +1765,25 @@ def stats(
         click.echo(hdr)
         click.echo("\u2500" * (max_lbl + 68 + (30 if sparkline else 0)))
 
-        for label, durs, trend_str in rows:
-            avg = sum(durs) / len(durs)
-            pv = _pcts(durs)
+        for label, g in rows:
+            pv = g["percentiles"]
             line = (
-                f"{label:<{max_lbl}}  {len(durs):>6}  "
-                f"{_fmt_ms(avg):>10}  {_fmt_ms(pv['p50']):>10}  "
+                f"{label:<{max_lbl}}  {g['count']:>6}  "
+                f"{_fmt_ms(g['avgMs']):>10}  {_fmt_ms(pv['p50']):>10}  "
                 f"{_fmt_ms(pv['p90']):>10}  {_fmt_ms(pv['p95']):>10}  "
                 f"{_fmt_ms(pv['p99']):>10}"
             )
-            if trend_str:
-                line += f"  {trend_str}"
+            if g.get("trend"):
+                line += f"  {g['trend']}"
             click.echo(line)
     else:
-        data = sorted_groups[0][1]
-        durs = sorted(d for _, d in data)
-        avg = sum(durs) / len(durs)
-        pv = _pcts(durs)
-        click.echo(f"  avg  {_fmt_ms(avg)}")
+        g = groups[0] if groups else result
+        pv = g["percentiles"]
+        click.echo(f"  avg  {_fmt_ms(g['avgMs'])}")
         for label, ms in pv.items():
             click.echo(f"  {label}  {_fmt_ms(ms)}")
-        if sparkline:
-            click.echo(f"\n  trend  {_trend(data)}")
+        if sparkline and g.get("trend"):
+            click.echo(f"\n  trend  {g['trend']}")
 
     click.echo()
 
