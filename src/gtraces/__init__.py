@@ -73,11 +73,12 @@ INTERESTING_LABELS = {
 _token = None
 
 
-class ApiError(click.ClickException):
-    """Raised on API failures; safe to propagate from worker threads."""
+class ApiError(Exception):
+    """Raised on API failures with actionable hints.
 
-    def __init__(self, message):
-        super().__init__(message)
+    Inherits from Exception (not click.ClickException) so library consumers
+    don't need click as a dependency for exception handling.
+    """
 
 
 def get_token():
@@ -309,7 +310,7 @@ def _pcts(values):
 
 
 def _cli_validate(fn):
-    """Decorator: convert ValueError to click.BadParameter in CLI commands."""
+    """Decorator: convert library exceptions to Click exceptions in CLI commands."""
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
@@ -317,6 +318,8 @@ def _cli_validate(fn):
             return fn(*args, **kwargs)
         except ValueError as e:
             raise click.BadParameter(str(e))
+        except ApiError as e:
+            raise click.ClickException(str(e))
 
     return wrapper
 
@@ -707,8 +710,8 @@ def trace_list(
         start, end, limit, min_latency=min_latency, services=services, labels=labels
     )
     traces = fetch_traces(project, params, max_results=limit)
-    if max_ms is not None:
-        traces = filter_traces(traces, max_ms=max_ms)
+    if services or max_ms is not None:
+        traces = filter_traces(traces, services=services, max_ms=max_ms)
     return traces
 
 
@@ -752,7 +755,10 @@ def trace_spans(
     min_latency=None,
     max_latency=None,
 ):
-    """Collect distinct span name counts. Returns dict[str, int] (name->count)."""
+    """Collect distinct span name counts.
+
+    Returns {spans: dict[str, int], trace_count: int}.
+    """
     _, max_ms = _parse_latency(max_latency)
     params = _build_params(
         start, end, limit, view="COMPLETE", min_latency=min_latency, services=services
@@ -763,7 +769,7 @@ def trace_spans(
     for t in traces:
         for s in t.get("spans", []):
             span_counts[s.get("name", "?")] += 1
-    return dict(span_counts.most_common())
+    return {"spans": dict(span_counts.most_common()), "trace_count": len(traces)}
 
 
 def trace_search(
@@ -807,13 +813,14 @@ def trace_search(
         filtered = filter_traces(
             traces,
             span_name=span_name,
+            services=services or None,
             min_ms=min_ms,
             max_ms=max_ms,
         )
         if order_asc or order_desc:
             reverse = order_desc is not None
             filtered.sort(
-                key=lambda t: _dur(_root(t.get("spans", [])) or {}),
+                key=lambda t: _dur(r) if (r := _root(t.get("spans", []))) else 0,
                 reverse=reverse,
             )
         return filtered
@@ -910,17 +917,12 @@ def trace_outliers(
     }
 
     if compare_svc:
-        svc_label = ", ".join(services) if services else "primary"
-        comparison = _compare_services(
+        result["comparison"] = _compare_services(
             project,
             outlier_list,
             all_traces,
             compare_svc,
-            pvals,
-            svc_label,
-            True,
         )
-        result["comparison"] = comparison
 
     return result
 
@@ -948,8 +950,10 @@ def trace_stats(
       bucket     — bucket size string (e.g. '5m', '1h'), or None
       sparkline  — include trend data per group
 
-    Returns dict with totalSpans, totalTraces, and group data.
-    Returns empty dict when no traces found.
+    Returns:
+      {} — when no traces found.
+      {"totalSpans": 0, "totalTraces": int} — when traces found but no spans matched.
+      Full dict with totalSpans, totalTraces, percentiles, groups, etc. on success.
     """
     _, max_ms = _parse_latency(max_latency)
     group_keys = list(group_by) if group_by else []
@@ -1052,7 +1056,10 @@ def cli(ctx, project, as_json):
     ctx.obj["project"] = project
     ctx.obj["json"] = as_json
     # Pre-warm auth token before any concurrency
-    get_token()
+    try:
+        get_token()
+    except ApiError as e:
+        raise click.ClickException(str(e))
 
 
 @cli.command("list")
@@ -1152,32 +1159,29 @@ def services(ctx, start, end, limit):
 @_cli_validate
 def spans(ctx, start, end, limit, services, min_latency, max_latency):
     """List distinct span names from sampled traces."""
-    p = ctx.obj["project"]
-    _, max_ms = _parse_latency(max_latency)
-    params = _build_params(
-        start, end, limit, view="COMPLETE", min_latency=min_latency, services=services
+    result = trace_spans(
+        ctx.obj["project"],
+        start=start,
+        end=end,
+        limit=limit,
+        services=services,
+        min_latency=min_latency,
+        max_latency=max_latency,
     )
-    traces = fetch_traces(p, params, max_results=limit)
-    traces = filter_traces(traces, services=services, max_ms=max_ms)
-
-    if not traces:
+    if not result["spans"]:
         click.echo("No traces found.")
         return
 
-    span_counts = Counter()
-    for t in traces:
-        for s in t.get("spans", []):
-            span_counts[s.get("name", "?")] += 1
-
     if ctx.obj["json"]:
-        click.echo(json.dumps(dict(span_counts.most_common()), indent=2))
+        click.echo(json.dumps(result["spans"], indent=2))
         return
 
+    span_counts = Counter(result["spans"])
     click.echo(f"{'SPAN NAME':<60} COUNT")
     click.echo("\u2500" * 70)
     for name, n in span_counts.most_common():
         click.echo(f"  {name:<60} {n}")
-    click.echo(f"\nSampled {len(traces)} traces.")
+    click.echo(f"\nSampled {result['trace_count']} traces.")
 
 
 @cli.command()
@@ -1273,9 +1277,6 @@ def search(
     label_dict = _parse_labels(labels)
     fields = _parse_fields(field_str)
 
-    if order_asc and order_desc:
-        raise click.UsageError("Cannot use both --order-asc and --order-desc")
-
     result = trace_search(
         p,
         start=start,
@@ -1364,26 +1365,16 @@ def _span_breakdown(all_spans):
     return span_self
 
 
-def _compare_services(
-    project,
-    outlier_list,
-    all_traces,
-    compare_svc,
-    primary_pvals,
-    primary_label,
-    as_json,
-):
+def _compare_services(project, outlier_list, all_traces, compare_svc):
     """Cross-service latency comparison during outlier windows.
 
-    Returns comparison data dict (for JSON mode) or None (after printing text).
+    Returns comparison data dict with distribution and per-window metrics.
     """
     cmp_durations = _to_durations(filter_traces(all_traces, services=compare_svc))
 
     comparison = {"service": compare_svc, "distribution": None, "windows": []}
 
     if not cmp_durations:
-        if not as_json:
-            click.echo(f"  No traces found for {compare_svc}.")
         return comparison
 
     cmp_pvals = _pcts([ms for ms, _ in cmp_durations])
@@ -1392,22 +1383,6 @@ def _compare_services(
         "count": cmp_n,
         "percentiles": {k: round(v, 1) for k, v in cmp_pvals.items()},
     }
-
-    if not as_json:
-        click.echo(f"  {compare_svc} latency ({cmp_n} traces):\n")
-        click.echo(f"  {'PCTL':<6} {primary_label:<30} {compare_svc}")
-        click.echo(f"  {'─' * 70}")
-        for label in ("p50", "p90", "p95", "p99"):
-            click.echo(
-                f"  {label:<6} {_fmt_ms(primary_pvals[label]):<30} "
-                f"{_fmt_ms(cmp_pvals[label])}"
-            )
-        click.echo("\n  During outlier windows:")
-        click.echo(
-            f"  {'#':<3} {'TIME':<26} "
-            f"{primary_label + ' latency':<25} {compare_svc + ' latency'}"
-        )
-        click.echo(f"  {'─' * 80}")
 
     # Build window params for each outlier
     windows = []
@@ -1444,7 +1419,7 @@ def _compare_services(
         for fut in as_completed(futures):
             win_results[futures[fut]] = fut.result()
 
-    for i, ((total_ms, r, _), win_traces) in enumerate(zip(windows, win_results), 1):
+    for _, ((total_ms, r, _), win_traces) in enumerate(zip(windows, win_results), 1):
         win_durs = _to_durations(filter_traces(win_traces or [], services=compare_svc))
 
         window_data = {"time": r["startTime"][:19], "primaryMs": round(total_ms, 1)}
@@ -1455,15 +1430,8 @@ def _compare_services(
             window_data["avgMs"] = round(avg, 1)
             window_data["maxMs"] = round(mx, 1)
             window_data["count"] = len(cmp_vals)
-            cmp_str = f"avg {_fmt_ms(avg)}, max {_fmt_ms(mx)} ({len(cmp_vals)} traces)"
-        else:
-            cmp_str = "(no traces)"
 
         comparison["windows"].append(window_data)
-        if not as_json:
-            click.echo(
-                f"  {i:<3} {r['startTime'][:19]:<26} {_fmt_ms(total_ms):<25} {cmp_str}"
-            )
 
     return comparison
 
