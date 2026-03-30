@@ -11,6 +11,7 @@ Also importable as a library:
 import functools
 import json
 import os
+import random
 import re
 import subprocess
 import time
@@ -132,7 +133,7 @@ def api_get(project, path, params=None):
         except HTTPError as e:
             body = e.read().decode(errors="replace")
             if e.code == 429 and attempt < _MAX_RETRIES:
-                delay = _RETRY_BASE_SEC * (2**attempt)
+                delay = _RETRY_BASE_SEC * (2**attempt) + random.uniform(0, 0.5)
                 time.sleep(delay)
                 last_exc = e
                 continue
@@ -1150,7 +1151,7 @@ def _pct_or_none(values):
     """Compute rounded percentiles or nulls for empty lists."""
     if not values:
         return {"p50": None, "p90": None, "p95": None, "p99": None}
-    return {k: round(v, 1) for k, v in _pcts(values).items()}
+    return {k: round(v, 1) for k, v in _pcts(sorted(values)).items()}
 
 
 def _avg_or_none(values):
@@ -1187,13 +1188,14 @@ def trace_compare(
     if window_sec <= 0:
         raise ValueError("--window-sec must be > 0")
 
+    resolved_end = end or _now()
     group_keys = list(group_by or [])
     _, a_min_ms = _parse_latency(a_min_latency)
     _, a_max_ms = _parse_latency(a_max_latency)
 
     a_params = _build_params(
         start,
-        end,
+        resolved_end,
         limit,
         view="ROOTSPAN",
         min_latency=a_min_latency,
@@ -1274,7 +1276,7 @@ def trace_compare(
         try:
             traces = fetch_traces(project, params, max_results=100)
             return {"ok": True, "traces": traces, "start": win_start, "end": win_end}
-        except Exception as e:
+        except (ApiError, OSError, ValueError) as e:
             return {
                 "ok": False,
                 "error": str(e),
@@ -1365,7 +1367,7 @@ def trace_compare(
             "schemaVersion": "compare.v1",
             "project": project,
             "start": _parse_time(start),
-            "end": end or _now(),
+            "end": resolved_end,
             "limit": limit,
             "windowSec": window_sec,
             "groupBy": group_keys,
