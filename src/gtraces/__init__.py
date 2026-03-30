@@ -13,6 +13,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -113,24 +114,39 @@ def set_token(tok):
     _token = tok
 
 
+_MAX_RETRIES = 3
+_RETRY_BASE_SEC = 1.0
+
+
 def api_get(project, path, params=None):
-    """GET from Cloud Trace API v1. Returns parsed JSON."""
+    """GET from Cloud Trace API v1 with retry on 429. Returns parsed JSON."""
     url = f"{API}/{project}{path}"
     if params:
         url += "?" + urlencode(params)
-    req = Request(url, headers={"Authorization": f"Bearer {get_token()}"})
-    try:
-        with urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
-    except HTTPError as e:
-        body = e.read().decode(errors="replace")
-        msgs = {
-            401: "Auth expired. Run: gcloud auth login",
-            403: f"Permission denied for project '{project}'",
-            404: "Not found",
-            429: "Rate limited. Try again shortly",
-        }
-        raise ApiError(f"{msgs.get(e.code, f'HTTP {e.code}')}\n{body}")
+    last_exc = None
+    for attempt in range(_MAX_RETRIES + 1):
+        req = Request(url, headers={"Authorization": f"Bearer {get_token()}"})
+        try:
+            with urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read())
+        except HTTPError as e:
+            body = e.read().decode(errors="replace")
+            if e.code == 429 and attempt < _MAX_RETRIES:
+                delay = _RETRY_BASE_SEC * (2**attempt)
+                time.sleep(delay)
+                last_exc = e
+                continue
+            msgs = {
+                401: "Auth expired. Run: gcloud auth login",
+                403: f"Permission denied for project '{project}'",
+                404: "Not found",
+                429: (
+                    f"Rate limited after {_MAX_RETRIES} retries. "
+                    "Reduce --limit or try again later"
+                ),
+            }
+            raise ApiError(f"{msgs.get(e.code, f'HTTP {e.code}')}\n{body}")
+    raise ApiError(f"Request failed after {_MAX_RETRIES} retries: {last_exc}")
 
 
 def fetch_traces(project, params, max_results=None):
@@ -250,6 +266,40 @@ def _build_params(
     return params
 
 
+def _matches_trace(
+    trace,
+    *,
+    span_name=None,
+    services=None,
+    labels=None,
+    min_ms=None,
+    max_ms=None,
+):
+    """Check whether trace matches root/service/label/latency filters."""
+    if isinstance(services, str):
+        services = (services,)
+    spans = trace.get("spans", [])
+    r = _root(spans)
+    if not r:
+        return False
+    if span_name and span_name not in (r.get("name") or ""):
+        return False
+    dur = _dur(r)
+    if min_ms is not None and dur < min_ms:
+        return False
+    if max_ms is not None and dur > max_ms:
+        return False
+    svc_set = set(services) if services else None
+    if svc_set and not any(
+        s.get("labels", {}).get("service.name") in svc_set for s in spans
+    ):
+        return False
+    rl = r.get("labels", {})
+    if labels and not all(rl.get(k) == v for k, v in labels.items()):
+        return False
+    return True
+
+
 def filter_traces(
     traces, *, span_name=None, services=None, labels=None, min_ms=None, max_ms=None
 ):
@@ -257,31 +307,18 @@ def filter_traces(
 
     Unified filter — replaces the former match_traces + _filter_by_labels.
     """
-    if isinstance(services, str):
-        services = (services,)
-    svc_set = set(services) if services else None
-    out = []
-    for t in traces:
-        r = _root(t.get("spans", []))
-        if not r:
-            continue
-        if span_name and span_name not in (r.get("name") or ""):
-            continue
-        dur = _dur(r)
-        if min_ms is not None and dur < min_ms:
-            continue
-        if max_ms is not None and dur > max_ms:
-            continue
-        if svc_set and not any(
-            s.get("labels", {}).get("service.name") in svc_set
-            for s in t.get("spans", [])
-        ):
-            continue
-        rl = r.get("labels", {})
-        if labels and not all(rl.get(k) == v for k, v in labels.items()):
-            continue
-        out.append(t)
-    return out
+    return [
+        t
+        for t in traces
+        if _matches_trace(
+            t,
+            span_name=span_name,
+            services=services,
+            labels=labels,
+            min_ms=min_ms,
+            max_ms=max_ms,
+        )
+    ]
 
 
 def _to_durations(traces):
@@ -719,7 +756,7 @@ def render_compare(result):
     )
     click.echo(
         f"B traces: seen={b['tracesSeen']} deduped={b['tracesDeduped']} "
-        f"used={b['tracesUsed']}"
+        f"(missing root: {b['skippedNoRoot']})"
     )
     click.echo()
 
@@ -1123,38 +1160,6 @@ def _avg_or_none(values):
     return round(sum(values) / len(values), 1)
 
 
-def _matches_trace(
-    trace,
-    *,
-    span_name=None,
-    services=None,
-    labels=None,
-    min_ms=None,
-    max_ms=None,
-):
-    """Check whether trace matches root/service/label/latency filters."""
-    spans = trace.get("spans", [])
-    r = _root(spans)
-    if not r:
-        return False
-    if span_name and span_name not in (r.get("name") or ""):
-        return False
-    dur = _dur(r)
-    if min_ms is not None and dur < min_ms:
-        return False
-    if max_ms is not None and dur > max_ms:
-        return False
-    svc_set = set(services) if services else None
-    if svc_set and not any(
-        s.get("labels", {}).get("service.name") in svc_set for s in spans
-    ):
-        return False
-    rl = r.get("labels", {})
-    if labels and not all(rl.get(k) == v for k, v in labels.items()):
-        return False
-    return True
-
-
 def trace_compare(
     project,
     *,
@@ -1223,16 +1228,32 @@ def trace_compare(
             }
         )
 
-    windows = []
+    # Build per-root windows, then merge overlapping ones to reduce API calls
+    raw_windows = []
     for r in a_roots:
         t_start = _ts(r["startTime"])
-        win_start = (t_start - timedelta(seconds=window_sec)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
+        raw_windows.append(
+            (
+                t_start - timedelta(seconds=window_sec),
+                t_start + timedelta(seconds=window_sec),
+            )
         )
-        win_end = (t_start + timedelta(seconds=window_sec)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
-        windows.append((r["startTime"], win_start, win_end))
+    raw_windows.sort()
+
+    windows = []
+    for ws, we in raw_windows:
+        if windows and ws <= windows[-1][1]:
+            # Overlapping — extend the previous window
+            prev_s, prev_e = windows[-1]
+            windows[-1] = (prev_s, max(prev_e, we))
+        else:
+            windows.append((ws, we))
+
+    # Format merged windows as RFC3339 strings
+    windows = [
+        (ws.strftime("%Y-%m-%dT%H:%M:%SZ"), we.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        for ws, we in windows
+    ]
 
     b_seen = 0
     b_roots_by_trace = {}
@@ -1241,7 +1262,7 @@ def trace_compare(
     windows_failed = 0
 
     def _fetch_window(win):
-        _, win_start, win_end = win
+        win_start, win_end = win
         params = _build_params(
             win_start,
             win_end,
@@ -1253,7 +1274,7 @@ def trace_compare(
         try:
             traces = fetch_traces(project, params, max_results=100)
             return {"ok": True, "traces": traces, "start": win_start, "end": win_end}
-        except ApiError as e:
+        except Exception as e:
             return {
                 "ok": False,
                 "error": str(e),
@@ -1263,7 +1284,7 @@ def trace_compare(
 
     if windows:
         with ThreadPoolExecutor(max_workers=min(len(windows), 8)) as pool:
-            futures = {pool.submit(_fetch_window, w): w[0] for w in windows}
+            futures = {pool.submit(_fetch_window, w): w for w in windows}
             for fut in as_completed(futures):
                 data = fut.result()
                 if not data["ok"]:
@@ -1310,8 +1331,8 @@ def trace_compare(
     groups = defaultdict(list)
     if group_keys:
         for r in b_roots_by_trace.values():
-            labels = r.get("labels", {})
-            key = tuple(labels.get(k, "") for k in group_keys)
+            rl = r.get("labels", {})
+            key = tuple(rl.get(k, "") for k in group_keys)
             groups[key].append(_dur(r))
 
     json_groups = []
@@ -1372,7 +1393,6 @@ def trace_compare(
             "windowsFailed": windows_failed,
             "tracesSeen": b_seen,
             "tracesDeduped": len(b_roots_by_trace),
-            "tracesUsed": len(b_durations),
             "skippedNoRoot": b_skipped_no_root,
             "distribution": dist,
         },
@@ -1749,7 +1769,7 @@ def compare(
 ):
     """Describe B latency conditioned on A traces (descriptive, non-causal).
 
-    
+    \b
     Examples:
       gct compare --a-service config-service --b-service ssp-service-go
       gct compare --a-service config-service --a-min-latency 600ms --b-service ssp-service-go
