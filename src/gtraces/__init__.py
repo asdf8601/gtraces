@@ -13,7 +13,6 @@ import json
 import os
 import re
 import subprocess
-import sys
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -31,6 +30,7 @@ __all__ = [
     "trace_search",
     "trace_outliers",
     "trace_stats",
+    "trace_compare",
     "get_token",
     "set_token",
     "fetch_traces",
@@ -209,12 +209,19 @@ def _parse_latency(s):
 def _parse_labels(label_tuple):
     """Parse ('key=value', ...) tuple into a dict."""
     d = {}
-    for l in label_tuple:
-        if "=" not in l:
-            raise click.BadParameter(f"Expected key=value, got: {l}")
-        k, v = l.split("=", 1)
+    for label in label_tuple:
+        if "=" not in label:
+            raise click.BadParameter(f"Expected key=value, got: {label}")
+        k, v = label.split("=", 1)
         d[k] = v
     return d or None
+
+
+def _parse_group_by(group_by):
+    """Parse comma-separated grouping keys."""
+    if not group_by:
+        return []
+    return [k.strip() for k in group_by.split(",") if k.strip()]
 
 
 def _build_params(
@@ -690,6 +697,70 @@ def _render_comparison(comparison, primary_pvals, services):
         click.echo(f"  {i:<3} {w['time']:<26} {_fmt_ms(w['primaryMs']):<25} {cmp_str}")
 
 
+def _fmt_opt_ms(ms):
+    """Format optional milliseconds value."""
+    return _fmt_ms(ms) if ms is not None else "-"
+
+
+def render_compare(result):
+    """Render conditional B|A comparison in text mode."""
+    a = result["conditionA"]
+    b = result["sampleB"]
+    group_by = result["meta"].get("groupBy", [])
+
+    click.echo("Conditional comparison B | A (descriptive, non-causal)")
+    click.echo(
+        f"A sample: {a['tracesMatched']} traces from {a['tracesFetched']} fetched "
+        f"(missing root: {a['skippedNoRoot']})"
+    )
+    click.echo(
+        f"B windows: {b['windowsSucceeded']}/{b['windowsTotal']} succeeded, "
+        f"{b['windowsFailed']} failed"
+    )
+    click.echo(
+        f"B traces: seen={b['tracesSeen']} deduped={b['tracesDeduped']} "
+        f"used={b['tracesUsed']}"
+    )
+    click.echo()
+
+    dist = b["distribution"]
+    if dist["count"] == 0:
+        click.echo("No B traces matched in conditioned windows.")
+    else:
+        p = dist["percentiles"]
+        click.echo(
+            f"B latency  avg {_fmt_opt_ms(dist['avgMs'])}  "
+            f"p50 {_fmt_opt_ms(p['p50'])}  p90 {_fmt_opt_ms(p['p90'])}  "
+            f"p95 {_fmt_opt_ms(p['p95'])}  p99 {_fmt_opt_ms(p['p99'])}"
+        )
+
+    groups = result.get("groups", [])
+    if groups:
+        click.echo()
+        click.echo(
+            f"{'GROUP':<42} {'COUNT':>6} {'avg':>10} {'p50':>10} {'p90':>10} {'p95':>10} {'p99':>10}"
+        )
+        click.echo("─" * 108)
+        for g in groups:
+            key = g.get("key", {})
+            label = (
+                " ".join(f"{k}={key.get(k, '') or '(none)'}" for k in group_by)
+                or "(all)"
+            )
+            p = g["percentiles"]
+            click.echo(
+                f"{label:<42} {g['count']:>6} {_fmt_opt_ms(g['avgMs']):>10} "
+                f"{_fmt_opt_ms(p['p50']):>10} {_fmt_opt_ms(p['p90']):>10} "
+                f"{_fmt_opt_ms(p['p95']):>10} {_fmt_opt_ms(p['p99']):>10}"
+            )
+
+    if result.get("warnings"):
+        click.echo()
+        click.echo("Warnings:")
+        for w in result["warnings"]:
+            click.echo(f"  - [{w['code']}] {w['message']}")
+
+
 # ── Programmatic API ─────────────────────────────────────────────────────────
 
 
@@ -1038,6 +1109,278 @@ def trace_stats(
     return out
 
 
+def _pct_or_none(values):
+    """Compute rounded percentiles or nulls for empty lists."""
+    if not values:
+        return {"p50": None, "p90": None, "p95": None, "p99": None}
+    return {k: round(v, 1) for k, v in _pcts(values).items()}
+
+
+def _avg_or_none(values):
+    """Compute rounded average or null for empty lists."""
+    if not values:
+        return None
+    return round(sum(values) / len(values), 1)
+
+
+def _matches_trace(
+    trace,
+    *,
+    span_name=None,
+    services=None,
+    labels=None,
+    min_ms=None,
+    max_ms=None,
+):
+    """Check whether trace matches root/service/label/latency filters."""
+    spans = trace.get("spans", [])
+    r = _root(spans)
+    if not r:
+        return False
+    if span_name and span_name not in (r.get("name") or ""):
+        return False
+    dur = _dur(r)
+    if min_ms is not None and dur < min_ms:
+        return False
+    if max_ms is not None and dur > max_ms:
+        return False
+    svc_set = set(services) if services else None
+    if svc_set and not any(
+        s.get("labels", {}).get("service.name") in svc_set for s in spans
+    ):
+        return False
+    rl = r.get("labels", {})
+    if labels and not all(rl.get(k) == v for k, v in labels.items()):
+        return False
+    return True
+
+
+def trace_compare(
+    project,
+    *,
+    start="1h",
+    end=None,
+    limit=50,
+    a_services=(),
+    a_labels=None,
+    a_span_name=None,
+    a_min_latency=None,
+    a_max_latency=None,
+    b_service=None,
+    b_labels=None,
+    b_span_name=None,
+    window_sec=30,
+    group_by=None,
+):
+    """Describe B latency conditioned on traces where A matches filters.
+
+    This is descriptive co-occurrence analysis in time windows, not causal
+    inference across traces.
+    """
+    if not b_service:
+        raise ValueError("--b-service is required")
+    if window_sec <= 0:
+        raise ValueError("--window-sec must be > 0")
+
+    group_keys = list(group_by or [])
+    _, a_min_ms = _parse_latency(a_min_latency)
+    _, a_max_ms = _parse_latency(a_max_latency)
+
+    a_params = _build_params(
+        start,
+        end,
+        limit,
+        view="ROOTSPAN",
+        min_latency=a_min_latency,
+        services=a_services,
+        labels=a_labels,
+    )
+    a_traces = fetch_traces(project, a_params, max_results=limit)
+    a_roots = []
+    skipped_a_no_root = 0
+    for t in a_traces:
+        r = _root(t.get("spans", []))
+        if not r:
+            skipped_a_no_root += 1
+            continue
+        if not _matches_trace(
+            t,
+            span_name=a_span_name,
+            services=a_services or None,
+            labels=a_labels,
+            min_ms=a_min_ms,
+            max_ms=a_max_ms,
+        ):
+            continue
+        a_roots.append(r)
+
+    warnings = []
+    if not a_roots:
+        warnings.append(
+            {
+                "code": "A_EMPTY_SAMPLE",
+                "message": "No A traces matched the given condition",
+            }
+        )
+
+    windows = []
+    for r in a_roots:
+        t_start = _ts(r["startTime"])
+        win_start = (t_start - timedelta(seconds=window_sec)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        win_end = (t_start + timedelta(seconds=window_sec)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        windows.append((r["startTime"], win_start, win_end))
+
+    b_seen = 0
+    b_roots_by_trace = {}
+    b_skipped_no_root = 0
+    windows_succeeded = 0
+    windows_failed = 0
+
+    def _fetch_window(win):
+        _, win_start, win_end = win
+        params = _build_params(
+            win_start,
+            win_end,
+            100,
+            view="ROOTSPAN",
+            services=(b_service,),
+            labels=b_labels,
+        )
+        try:
+            traces = fetch_traces(project, params, max_results=100)
+            return {"ok": True, "traces": traces, "start": win_start, "end": win_end}
+        except ApiError as e:
+            return {
+                "ok": False,
+                "error": str(e),
+                "start": win_start,
+                "end": win_end,
+            }
+
+    if windows:
+        with ThreadPoolExecutor(max_workers=min(len(windows), 8)) as pool:
+            futures = {pool.submit(_fetch_window, w): w[0] for w in windows}
+            for fut in as_completed(futures):
+                data = fut.result()
+                if not data["ok"]:
+                    windows_failed += 1
+                    warnings.append(
+                        {
+                            "code": "B_WINDOW_FETCH_FAILED",
+                            "message": (
+                                f"window {data['start']}..{data['end']} failed: "
+                                f"{data['error'].splitlines()[0]}"
+                            ),
+                        }
+                    )
+                    continue
+
+                windows_succeeded += 1
+                traces = data["traces"]
+                for t in traces:
+                    r = _root(t.get("spans", []))
+                    if not r:
+                        b_skipped_no_root += 1
+                        continue
+                    if not _matches_trace(
+                        t,
+                        span_name=b_span_name,
+                        services=(b_service,),
+                        labels=b_labels,
+                    ):
+                        continue
+                    b_seen += 1
+                    tid = t.get("traceId")
+                    if tid and tid not in b_roots_by_trace:
+                        b_roots_by_trace[tid] = r
+
+    if windows and windows_succeeded == 0:
+        warnings.append(
+            {
+                "code": "B_ALL_WINDOWS_FAILED",
+                "message": "All B window fetches failed; result is empty",
+            }
+        )
+
+    b_durations = sorted(_dur(r) for r in b_roots_by_trace.values())
+    groups = defaultdict(list)
+    if group_keys:
+        for r in b_roots_by_trace.values():
+            labels = r.get("labels", {})
+            key = tuple(labels.get(k, "") for k in group_keys)
+            groups[key].append(_dur(r))
+
+    json_groups = []
+    for key, durs in groups.items():
+        durs = sorted(durs)
+        json_groups.append(
+            {
+                "key": dict(zip(group_keys, key)),
+                "count": len(durs),
+                "avgMs": _avg_or_none(durs),
+                "percentiles": _pct_or_none(durs),
+            }
+        )
+
+    json_groups.sort(
+        key=lambda g: (
+            -g["count"],
+            json.dumps(g.get("key", {}), sort_keys=True, separators=(",", ":")),
+        )
+    )
+
+    dist = {
+        "count": len(b_durations),
+        "avgMs": _avg_or_none(b_durations),
+        "percentiles": _pct_or_none(b_durations),
+    }
+
+    return {
+        "meta": {
+            "schemaVersion": "compare.v1",
+            "project": project,
+            "start": _parse_time(start),
+            "end": end or _now(),
+            "limit": limit,
+            "windowSec": window_sec,
+            "groupBy": group_keys,
+        },
+        "conditionA": {
+            "filters": {
+                "services": list(a_services),
+                "labels": a_labels or {},
+                "spanName": a_span_name,
+                "minLatency": a_min_latency,
+                "maxLatency": a_max_latency,
+            },
+            "tracesFetched": len(a_traces),
+            "tracesMatched": len(a_roots),
+            "skippedNoRoot": skipped_a_no_root,
+        },
+        "sampleB": {
+            "filters": {
+                "service": b_service,
+                "labels": b_labels or {},
+                "spanName": b_span_name,
+            },
+            "windowsTotal": len(windows),
+            "windowsSucceeded": windows_succeeded,
+            "windowsFailed": windows_failed,
+            "tracesSeen": b_seen,
+            "tracesDeduped": len(b_roots_by_trace),
+            "tracesUsed": len(b_durations),
+            "skippedNoRoot": b_skipped_no_root,
+            "distribution": dist,
+        },
+        "groups": json_groups,
+        "warnings": warnings,
+    }
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
@@ -1328,6 +1671,111 @@ def search(
             interesting = {k: v for k, v in lbl_d.items() if k in INTERESTING_LABELS}
             lbl = " ".join(f"{k}={v}" for k, v in interesting.items())
             click.echo(f"{tid:<36}  {name:<40}  {dur:>10}  {sid:<20}  {lbl}")
+
+
+@cli.command()
+@click.option(
+    "--start",
+    default="1h",
+    show_default=True,
+    help="Start time (1h, 30m, 2d, or RFC3339)",
+)
+@click.option("--end", default=None, help="End time (default: now)")
+@click.option(
+    "--limit", default=50, show_default=True, type=int, help="Max A traces to fetch"
+)
+@click.option(
+    "--a-service",
+    "a_services",
+    multiple=True,
+    help="A filter: service.name (repeatable)",
+)
+@click.option("--a-label", "a_labels", multiple=True, help="A filter: label key=value")
+@click.option(
+    "--a-span-name",
+    default=None,
+    help="A filter: root span name (substring match)",
+)
+@click.option(
+    "--a-min-latency",
+    default=None,
+    help="A filter: min root latency (500ms, 1s)",
+)
+@click.option(
+    "--a-max-latency",
+    default=None,
+    help="A filter: max root latency (500ms, 1s)",
+)
+@click.option(
+    "--b-service",
+    required=True,
+    help="B target service.name (required)",
+)
+@click.option("--b-label", "b_labels", multiple=True, help="B filter: label key=value")
+@click.option(
+    "--b-span-name",
+    default=None,
+    help="B filter: root span name (substring match)",
+)
+@click.option(
+    "--window-sec",
+    default=30,
+    show_default=True,
+    type=int,
+    help="Conditioning window around each A trace (seconds)",
+)
+@click.option(
+    "--group-by",
+    default=None,
+    help="Comma-separated B root label keys to group by",
+)
+@click.pass_context
+@_cli_validate
+def compare(
+    ctx,
+    start,
+    end,
+    limit,
+    a_services,
+    a_labels,
+    a_span_name,
+    a_min_latency,
+    a_max_latency,
+    b_service,
+    b_labels,
+    b_span_name,
+    window_sec,
+    group_by,
+):
+    """Describe B latency conditioned on A traces (descriptive, non-causal).
+
+    
+    Examples:
+      gct compare --a-service config-service --b-service ssp-service-go
+      gct compare --a-service config-service --a-min-latency 600ms --b-service ssp-service-go
+      gct --json compare --a-service config-service --b-service ssp-service-go --group-by cloud.region
+    """
+    result = trace_compare(
+        ctx.obj["project"],
+        start=start,
+        end=end,
+        limit=limit,
+        a_services=a_services,
+        a_labels=_parse_labels(a_labels),
+        a_span_name=a_span_name,
+        a_min_latency=a_min_latency,
+        a_max_latency=a_max_latency,
+        b_service=b_service,
+        b_labels=_parse_labels(b_labels),
+        b_span_name=b_span_name,
+        window_sec=window_sec,
+        group_by=_parse_group_by(group_by),
+    )
+
+    if ctx.obj["json"]:
+        click.echo(json.dumps(result, indent=2))
+    else:
+        render_compare(result)
 
 
 @cli.command()
