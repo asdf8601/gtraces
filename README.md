@@ -32,6 +32,7 @@ gct get ID     # span tree
 gct analyze ID # timeline with bottleneck detection
 gct search     # filter by service, labels, latency, span name
 gct outliers   # find slow traces with per-span breakdown
+gct compare    # describe B latency conditioned on A traces
 ```
 
 ## Common flags
@@ -62,6 +63,9 @@ gct search --service my-service --min-latency 300ms --max-latency 500ms
 
 # Find p95 outliers and compare with another service
 gct outliers --service my-service --compare other-service
+
+# Describe B when A matches a condition (descriptive, non-causal)
+gct compare --a-service config-service --a-min-latency 600ms --b-service ssp-service-go --group-by cloud.region
 
 # Analyze a specific trace
 gct analyze <trace-id>
