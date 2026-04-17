@@ -1,3 +1,9 @@
+## v0.2.2 (2026-04-17)
+
+### Fix
+
+- rename workflow to publish.yml to match PyPI trusted publisher config
+
 ## v0.2.1 (2026-04-17)
 
 ### Fix
