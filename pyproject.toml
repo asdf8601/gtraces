@@ -1,6 +1,6 @@
 [project]
 name = "gtraces"
-version = "0.1.0"
+version = "0.2.0"
 description = "CLI for GCP Cloud Trace API v1"
 requires-python = ">=3.10"
 dependencies = ["click>=8.0"]
@@ -14,7 +14,7 @@ build-backend = "uv_build"
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.1.0"
+version = "0.2.0"
 tag_format = "v$version"
 version_files = ["pyproject.toml:^version"]
 update_changelog_on_bump = true
