@@ -5,7 +5,7 @@ CLI for querying and analyzing traces from the GCP Cloud Trace API v1.
 ## Install
 
 ```bash
-# From PyPI
+# From PyPI (recommended)
 uv tool install gtraces
 
 # From GitHub
