@@ -1,3 +1,9 @@
+## v0.2.1 (2026-04-17)
+
+### Fix
+
+- clarify PyPI as recommended install method in README
+
 ## v0.2.0 (2026-04-17)
 
 ### BREAKING CHANGE
