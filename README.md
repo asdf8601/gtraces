@@ -5,6 +5,9 @@ CLI for querying and analyzing traces from the GCP Cloud Trace API v1.
 ## Install
 
 ```bash
+# Run without install (ephemeral)
+uvx gtraces --help
+
 # From PyPI (recommended)
 uv tool install gtraces
 
@@ -13,6 +16,16 @@ uv tool install git+https://github.com/asdf8601/gtraces
 
 # From source
 uv sync
+```
+
+### Run with `uvx`
+
+`uvx` runs the CLI in an ephemeral venv — no global install required:
+
+```bash
+uvx gtraces list --start 1h
+uvx gtraces search --service my-service --min-latency 300ms
+uvx --from gtraces==0.2.2 gtraces analyze <trace-id>   # pin a version
 ```
 
 Requires `gcloud` CLI for authentication (`gcloud auth print-access-token`).
