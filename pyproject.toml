@@ -6,8 +6,16 @@ requires-python = ">=3.10"
 dependencies = ["click>=8.0"]
 
 [project.scripts]
-gct = "gtraces:cli"
+gtraces = "gtraces:cli"
 
 [build-system]
 requires = ["uv_build>=0.7.2,<0.8"]
 build-backend = "uv_build"
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+version = "0.1.0"
+tag_format = "v$version"
+version_files = ["pyproject.toml:^version"]
+update_changelog_on_bump = true
+major_version_zero = true

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gct - CLI for GCP Cloud Trace API v1.
+"""gtraces - CLI for GCP Cloud Trace API v1.
 
 Also importable as a library:
 
@@ -198,14 +198,15 @@ def _now():
 
 
 def _parse_time(s):
-    """Parse relative (1h, 30m, 2d) or RFC3339 to RFC3339 string."""
-    m = re.match(r"^(\d+)([mhd])$", s)
+    """Parse relative (1h, 30m, 2d, 1w) or RFC3339 to RFC3339 string."""
+    m = re.match(r"^(\d+)([mhdw])$", s)
     if m:
         n, u = int(m.group(1)), m.group(2)
         delta = {
             "m": timedelta(minutes=n),
             "h": timedelta(hours=n),
             "d": timedelta(days=n),
+            "w": timedelta(weeks=n),
         }[u]
         return (datetime.now(timezone.utc) - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
     return s
@@ -386,14 +387,17 @@ def _sparkline(values):
 
 
 def _parse_bucket(s):
-    """Parse bucket size (5m, 10m, 1h) to timedelta."""
-    m = re.match(r"^(\d+)([mhd])$", s)
+    """Parse bucket size (5m, 10m, 1h, 1w) to timedelta."""
+    m = re.match(r"^(\d+)([mhdw])$", s)
     if not m:
-        raise ValueError(f"Bad bucket: {s} (use e.g. 5m, 1h)")
+        raise ValueError(f"Bad bucket: {s} (use e.g. 5m, 1h, 1w)")
     n, u = int(m.group(1)), m.group(2)
-    return {"m": timedelta(minutes=n), "h": timedelta(hours=n), "d": timedelta(days=n)}[
-        u
-    ]
+    return {
+        "m": timedelta(minutes=n),
+        "h": timedelta(hours=n),
+        "d": timedelta(days=n),
+        "w": timedelta(weeks=n),
+    }[u]
 
 
 def _make_buckets(data, bucket_delta):
@@ -1056,7 +1060,7 @@ def trace_stats(
     Parameters:
       group_by   — list of label keys to group by, or None
       labels     — dict of label filters, or None
-      bucket     — bucket size string (e.g. '5m', '1h'), or None
+      bucket     — bucket size string (e.g. '5m', '1h', '1w'), or None
       sparkline  — include trend data per group
 
     Returns:
@@ -1416,7 +1420,7 @@ def trace_compare(
 @click.option("--json", "as_json", is_flag=True, help="Raw JSON output")
 @click.pass_context
 def cli(ctx, project, as_json):
-    """gct - query and analyze GCP Cloud Traces."""
+    """gtraces - query and analyze GCP Cloud Traces."""
     ctx.ensure_object(dict)
     ctx.obj["project"] = project
     ctx.obj["json"] = as_json
@@ -1432,7 +1436,7 @@ def cli(ctx, project, as_json):
     "--start",
     default="1h",
     show_default=True,
-    help="Start time (1h, 30m, 2d, or RFC3339)",
+    help="Start time (1h, 30m, 2d, 1w, or RFC3339)",
 )
 @click.option("--end", default=None, help="End time (default: now)")
 @click.option(
@@ -1470,7 +1474,7 @@ def list_cmd(ctx, start, end, limit, services, labels, min_latency, max_latency)
     "--start",
     default="3h",
     show_default=True,
-    help="Start time (1h, 30m, 2d, or RFC3339)",
+    help="Start time (1h, 30m, 2d, 1w, or RFC3339)",
 )
 @click.option("--end", default=None, help="End time (default: now)")
 @click.option(
@@ -1509,7 +1513,7 @@ def services(ctx, start, end, limit):
     "--start",
     default="1h",
     show_default=True,
-    help="Start time (1h, 30m, 2d, or RFC3339)",
+    help="Start time (1h, 30m, 2d, 1w, or RFC3339)",
 )
 @click.option("--end", default=None, help="End time (default: now)")
 @click.option(
@@ -1575,7 +1579,7 @@ def get(ctx, trace_id, bars, name_width):
     "--start",
     default="1h",
     show_default=True,
-    help="Start time (1h, 30m, 2d, or RFC3339)",
+    help="Start time (1h, 30m, 2d, 1w, or RFC3339)",
 )
 @click.option("--end", default=None, help="End time (default: now)")
 @click.option(
@@ -1634,9 +1638,9 @@ def search(
 
     \b
     Examples:
-      gct search --span-name "POST /v1/rtb" --min-latency 500ms
-      gct search --min-latency 300ms --max-latency 500ms --service my-service
-      gct search --service my-service --parent-span-id 123456
+      gtraces search --span-name "POST /v1/rtb" --min-latency 500ms
+      gtraces search --min-latency 300ms --max-latency 500ms --service my-service
+      gtraces search --service my-service --parent-span-id 123456
     """
     p = ctx.obj["project"]
     label_dict = _parse_labels(labels)
@@ -1700,7 +1704,7 @@ def search(
     "--start",
     default="1h",
     show_default=True,
-    help="Start time (1h, 30m, 2d, or RFC3339)",
+    help="Start time (1h, 30m, 2d, 1w, or RFC3339)",
 )
 @click.option("--end", default=None, help="End time (default: now)")
 @click.option(
@@ -1773,9 +1777,9 @@ def compare(
 
     \b
     Examples:
-      gct compare --a-service config-service --b-service ssp-service-go
-      gct compare --a-service config-service --a-min-latency 600ms --b-service ssp-service-go
-      gct --json compare --a-service config-service --b-service ssp-service-go --group-by cloud.region
+      gtraces compare --a-service config-service --b-service ssp-service-go
+      gtraces compare --a-service config-service --a-min-latency 600ms --b-service ssp-service-go
+      gtraces --json compare --a-service config-service --b-service ssp-service-go --group-by cloud.region
     """
     result = trace_compare(
         ctx.obj["project"],
@@ -1914,7 +1918,7 @@ def _compare_services(project, outlier_list, all_traces, compare_svc):
     "--start",
     default="1h",
     show_default=True,
-    help="Start time (1h, 30m, 2d, or RFC3339)",
+    help="Start time (1h, 30m, 2d, 1w, or RFC3339)",
 )
 @click.option("--end", default=None, help="End time (default: now)")
 @click.option(
@@ -1960,9 +1964,9 @@ def outliers(
 
     \b
     Examples:
-      gct outliers --service my-service
-      gct outliers --service my-service --label k8s.cluster.name=us-east1-a
-      gct outliers --service my-service --compare other-service
+      gtraces outliers --service my-service
+      gtraces outliers --service my-service --label k8s.cluster.name=us-east1-a
+      gtraces outliers --service my-service --compare other-service
     """
     p = ctx.obj["project"]
     as_json = ctx.obj["json"]
@@ -2044,7 +2048,7 @@ def outliers(
     "--start",
     default="1h",
     show_default=True,
-    help="Start time (1h, 30m, 2d, or RFC3339)",
+    help="Start time (1h, 30m, 2d, 1w, or RFC3339)",
 )
 @click.option("--end", default=None, help="End time (default: now)")
 @click.option(
@@ -2069,7 +2073,10 @@ def outliers(
 @click.option("--min-latency", default=None, help="Min latency (500ms, 1s)")
 @click.option("--max-latency", default=None, help="Max latency (500ms, 1s)")
 @click.option(
-    "--bucket", "bucket_str", default=None, help="Time bucket size (e.g. 5m, 10m, 1h)"
+    "--bucket",
+    "bucket_str",
+    default=None,
+    help="Time bucket size (e.g. 5m, 10m, 1h, 1w)",
 )
 @click.option(
     "--sparkline", "sparkline", is_flag=True, help="Show p50 trend sparkline per group"
@@ -2097,11 +2104,11 @@ def stats(
 
     \b
     Examples:
-      gct stats --span-name "POST /v1/rtb" --group-by cloud.region
-      gct stats --span-name HTTP --group-by cloud.region,service.name
-      gct stats --service my-service --group-by abtest
-      gct stats --service my-service --bucket 5m
-      gct stats --service my-service --group-by abtest --sparkline
+      gtraces stats --span-name "POST /v1/rtb" --group-by cloud.region
+      gtraces stats --span-name HTTP --group-by cloud.region,service.name
+      gtraces stats --service my-service --group-by abtest
+      gtraces stats --service my-service --bucket 5m
+      gtraces stats --service my-service --group-by abtest --sparkline
     """
     p = ctx.obj["project"]
     as_json = ctx.obj["json"]

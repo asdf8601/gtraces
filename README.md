@@ -1,12 +1,15 @@
-# gct
+# gtraces
 
 CLI for querying and analyzing traces from the GCP Cloud Trace API v1.
 
 ## Install
 
 ```bash
+# From PyPI
+uv tool install gtraces
+
 # From GitHub
-uv tool install git+https://github.com/asdf8601/gct
+uv tool install git+https://github.com/asdf8601/gtraces
 
 # From source
 uv sync
@@ -25,14 +28,14 @@ Or pass `--project` on each invocation.
 ## Commands
 
 ```
-gct list       # recent traces
-gct services   # services and endpoints seen
-gct spans      # distinct span names
-gct get ID     # span tree
-gct analyze ID # timeline with bottleneck detection
-gct search     # filter by service, labels, latency, span name
-gct outliers   # find slow traces with per-span breakdown
-gct compare    # describe B latency conditioned on A traces
+gtraces list       # recent traces
+gtraces services   # services and endpoints seen
+gtraces spans      # distinct span names
+gtraces get ID     # span tree
+gtraces analyze ID # timeline with bottleneck detection
+gtraces search     # filter by service, labels, latency, span name
+gtraces outliers   # find slow traces with per-span breakdown
+gtraces compare    # describe B latency conditioned on A traces
 ```
 
 ## Common flags
@@ -53,23 +56,23 @@ gct compare    # describe B latency conditioned on A traces
 
 ```bash
 # List traces from the last hour
-gct list --start 1h
+gtraces list --start 1h
 
 # Services in the last 3 hours
-gct services --start 3h
+gtraces services --start 3h
 
 # Search with latency range
-gct search --service my-service --min-latency 300ms --max-latency 500ms
+gtraces search --service my-service --min-latency 300ms --max-latency 500ms
 
 # Find p95 outliers and compare with another service
-gct outliers --service my-service --compare other-service
+gtraces outliers --service my-service --compare other-service
 
 # Describe B when A matches a condition (descriptive, non-causal)
-gct compare --a-service config-service --a-min-latency 600ms --b-service ssp-service-go --group-by cloud.region
+gtraces compare --a-service config-service --a-min-latency 600ms --b-service ssp-service-go --group-by cloud.region
 
 # Analyze a specific trace
-gct analyze <trace-id>
+gtraces analyze <trace-id>
 
 # JSON output
-gct --json search --service my-service --start 1h
+gtraces --json search --service my-service --start 1h
 ```
