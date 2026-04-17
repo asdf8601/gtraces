@@ -13,23 +13,34 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.cz.outputs.version }}
+      bumped: ${{ steps.diff.outputs.bumped }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
+      - id: prev
+        run: echo "version=$(grep -E '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)" >> $GITHUB_OUTPUT
       - id: cz
         uses: commitizen-tools/commitizen-action@master
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           changelog_increment_filename: body.md
-      - env:
+      - id: diff
+        run: |
+          if [ "${{ steps.cz.outputs.version }}" != "${{ steps.prev.outputs.version }}" ]; then
+            echo "bumped=true" >> $GITHUB_OUTPUT
+          else
+            echo "bumped=false" >> $GITHUB_OUTPUT
+          fi
+      - if: steps.diff.outputs.bumped == 'true'
+        env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release create "v${{ steps.cz.outputs.version }}" --notes-file body.md
 
   publish:
     needs: bump
-    if: needs.bump.outputs.version != ''
+    if: needs.bump.outputs.bumped == 'true'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
