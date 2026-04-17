@@ -11,6 +11,8 @@ jobs:
   bump:
     if: "!startsWith(github.event.head_commit.message, 'bump:')"
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.cz.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,3 +26,18 @@ jobs:
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release create "v${{ steps.cz.outputs.version }}" --notes-file body.md
+
+  publish:
+    needs: bump
+    if: needs.bump.outputs.version != ''
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.bump.outputs.version }}
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build
+      - uses: pypa/gh-action-pypi-publish@release/v1
