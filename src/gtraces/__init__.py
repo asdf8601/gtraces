@@ -341,11 +341,14 @@ def _matches_trace(
         return False
     if max_ms is not None and dur > max_ms:
         return False
-    svc_set = set(services) if services else None
-    if svc_set and not any(
-        s.get("labels", {}).get("service.name") in svc_set for s in spans
-    ):
-        return False
+    if services:
+        # Substring match — mirrors the Cloud Trace API ``service.name:<sub>``
+        # semantics. A trace passes if any span's ``service.name`` label
+        # contains the requested substring. Required for distributed traces
+        # where the requested service appears as a nested span, not the root.
+        span_services = [s.get("labels", {}).get("service.name", "") for s in spans]
+        if not any(sub in name for sub in services for name in span_services):
+            return False
     rl = r.get("labels", {})
     if labels and not all(rl.get(k) == v for k, v in labels.items()):
         return False
@@ -960,7 +963,10 @@ def trace_search(
         raise ValueError("Cannot use both order_asc and order_desc")
     _, min_ms = _parse_latency(min_latency)
     _, max_ms = _parse_latency(max_latency)
-    view = "COMPLETE" if parent_span_id else "ROOTSPAN"
+    # COMPLETE view is needed when the requested service may appear only as a
+    # nested span (e.g. a downstream RPC). ROOTSPAN view exposes only the root,
+    # so service filtering would miss those traces entirely.
+    view = "COMPLETE" if parent_span_id or services else "ROOTSPAN"
     params = _build_params(
         start,
         end,
