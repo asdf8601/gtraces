@@ -14,6 +14,7 @@ import os
 import random
 import re
 import subprocess
+import sys
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -161,15 +162,23 @@ def fetch_traces(project, params, max_results=None, max_pages=_MAX_PAGES):
     request has no server-side filter and matches are sparse.
     """
     traces = []
+    last_token = None
     for _ in range(max_pages):
         data = api_get(project, "/traces", params)
         traces.extend(data.get("traces", []))
         if max_results and len(traces) >= max_results:
             return traces[:max_results]
-        token = data.get("nextPageToken")
-        if not token:
+        last_token = data.get("nextPageToken")
+        if not last_token:
             break
-        params = {**params, "pageToken": token}
+        params = {**params, "pageToken": last_token}
+    else:
+        if last_token:
+            print(
+                f"warning: stopped after {max_pages} pages ({len(traces)} traces); "
+                "more results available. Narrow the filter or raise max_pages.",
+                file=sys.stderr,
+            )
     return traces
 
 
@@ -319,9 +328,7 @@ def _matches_trace(
     r = _root(spans)
     if not r:
         return False
-    if span_name and not any(
-        span_name in (s.get("name") or "") for s in spans
-    ):
+    if span_name and not any(span_name in (s.get("name") or "") for s in spans):
         return False
     dur = _dur(r)
     if min_ms is not None and dur < min_ms:
@@ -1624,7 +1631,11 @@ def get(ctx, trace_id, bars, name_width):
 @click.option(
     "--limit", default=50, show_default=True, type=int, help="Max traces to fetch"
 )
-@click.option("--span-name", default=None, help="Root span name (substring match)")
+@click.option(
+    "--span-name",
+    default=None,
+    help="Span name (substring match, any span in trace)",
+)
 @click.option("--label", "labels", multiple=True, help="Label key=value (repeatable)")
 @click.option("--min-latency", default=None, help="Min latency (500ms, 1s)")
 @click.option("--max-latency", default=None, help="Max latency (500ms, 1s)")
@@ -1759,7 +1770,7 @@ def search(
 @click.option(
     "--a-span-name",
     default=None,
-    help="A filter: root span name (substring match)",
+    help="A filter: span name (substring match, any span in trace)",
 )
 @click.option(
     "--a-min-latency",
@@ -1780,7 +1791,7 @@ def search(
 @click.option(
     "--b-span-name",
     default=None,
-    help="B filter: root span name (substring match)",
+    help="B filter: span name (substring match, any span in trace)",
 )
 @click.option(
     "--window-sec",
