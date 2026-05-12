@@ -150,10 +150,18 @@ def api_get(project, path, params=None):
     raise ApiError(f"Request failed after {_MAX_RETRIES} retries: {last_exc}")
 
 
-def fetch_traces(project, params, max_results=None):
-    """Fetch traces with automatic pagination."""
+_MAX_PAGES = 50  # safety budget for sparse-match queries (≈5000 traces @ pageSize 100)
+
+
+def fetch_traces(project, params, max_results=None, max_pages=_MAX_PAGES):
+    """Fetch traces with automatic pagination.
+
+    Stops at ``max_results`` (caller cap) or ``max_pages`` (safety budget),
+    whichever comes first. The page budget prevents unbounded scans when the
+    request has no server-side filter and matches are sparse.
+    """
     traces = []
-    while True:
+    for _ in range(max_pages):
         data = api_get(project, "/traces", params)
         traces.extend(data.get("traces", []))
         if max_results and len(traces) >= max_results:
@@ -198,7 +206,13 @@ def _now():
 
 
 def _parse_time(s):
-    """Parse relative (1h, 30m, 2d, 1w) or RFC3339 to RFC3339 string."""
+    """Parse relative (1h, 30m, 2d, 1w) or RFC3339 to RFC3339 string.
+
+    Tolerates a leading ``-`` (e.g. ``-10d``) for symmetry with common CLI
+    relative-time conventions.
+    """
+    if s.startswith("-"):
+        s = s[1:]
     m = re.match(r"^(\d+)([mhdw])$", s)
     if m:
         n, u = int(m.group(1)), m.group(2)
@@ -243,9 +257,22 @@ def _parse_group_by(group_by):
 
 
 def _build_params(
-    start, end, limit, view="ROOTSPAN", min_latency=None, services=None, labels=None
+    start,
+    end,
+    limit,
+    view="ROOTSPAN",
+    min_latency=None,
+    services=None,
+    labels=None,
+    span_name=None,
 ):
-    """Build common API query params."""
+    """Build common API query params.
+
+    ``span_name`` is pushed as a Cloud Trace ``span:<substring>`` filter so the
+    server narrows the result set before paginating. This is critical for rare
+    or nested spans, which would otherwise require scanning every trace in the
+    window.
+    """
     params = {
         "pageSize": min(limit, 100),
         "startTime": _parse_time(start),
@@ -253,6 +280,8 @@ def _build_params(
         "view": view,
     }
     parts = []
+    if span_name:
+        parts.append(f"span:{span_name}")
     if min_latency:
         filt, ms = _parse_latency(min_latency)
         if ms and ms > 0:
@@ -277,14 +306,22 @@ def _matches_trace(
     min_ms=None,
     max_ms=None,
 ):
-    """Check whether trace matches root/service/label/latency filters."""
+    """Check whether trace matches span-name/service/label/latency filters.
+
+    ``span_name`` is matched as a substring against ANY span in the trace,
+    mirroring the Cloud Trace API ``span:<name>`` semantics. This is required
+    for nested spans (e.g. ``load_optimizer`` nested inside ``reload``).
+    Latency filters apply to the root span duration.
+    """
     if isinstance(services, str):
         services = (services,)
     spans = trace.get("spans", [])
     r = _root(spans)
     if not r:
         return False
-    if span_name and span_name not in (r.get("name") or ""):
+    if span_name and not any(
+        span_name in (s.get("name") or "") for s in spans
+    ):
         return False
     dur = _dur(r)
     if min_ms is not None and dur < min_ms:
@@ -919,6 +956,7 @@ def trace_search(
         min_latency=min_latency,
         services=services,
         labels=labels,
+        span_name=span_name,
     )
     traces = fetch_traces(project, params, max_results=limit)
 
@@ -1080,6 +1118,7 @@ def trace_stats(
         min_latency=min_latency,
         services=services,
         labels=labels,
+        span_name=span_pattern,
     )
     all_traces = fetch_traces(project, params, max_results=limit)
     filtered = filter_traces(all_traces, max_ms=max_ms)
