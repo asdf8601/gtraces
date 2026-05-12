@@ -1,3 +1,9 @@
+## v0.2.3 (2026-05-12)
+
+### Fix
+
+- **search**: push span filter server-side and match nested spans (#4)
+
 ## v0.2.2 (2026-04-17)
 
 ### Fix
