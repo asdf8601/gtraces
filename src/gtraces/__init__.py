@@ -166,9 +166,15 @@ def fetch_traces(project, params, max_results=None, max_pages=_MAX_PAGES):
     for _ in range(max_pages):
         data = api_get(project, "/traces", params)
         traces.extend(data.get("traces", []))
-        if max_results and len(traces) >= max_results:
-            return traces[:max_results]
         last_token = data.get("nextPageToken")
+        if max_results and len(traces) >= max_results:
+            if last_token:
+                print(
+                    f"warning: stopped at --limit {max_results} ({len(traces)} traces fetched); "
+                    "more results available. Raise --limit to fetch more.",
+                    file=sys.stderr,
+                )
+            return traces[:max_results]
         if not last_token:
             break
         params = {**params, "pageToken": last_token}
