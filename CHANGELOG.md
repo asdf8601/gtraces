@@ -1,3 +1,9 @@
+## v0.2.4 (2026-05-12)
+
+### Fix
+
+- **search**: align --service semantics with Cloud Trace API (#5)
+
 ## v0.2.3 (2026-05-12)
 
 ### Fix
