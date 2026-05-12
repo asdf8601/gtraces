@@ -872,8 +872,18 @@ def trace_list(
 ):
     """Fetch and filter recent traces. Returns list of trace dicts."""
     _, max_ms = _parse_latency(max_latency)
+    # Same reason as ``trace_search``: nested-service spans are invisible in
+    # ROOTSPAN view, so the client-side service filter would silently drop
+    # traces whose requested service is a downstream RPC.
+    view = "COMPLETE" if services else "ROOTSPAN"
     params = _build_params(
-        start, end, limit, min_latency=min_latency, services=services, labels=labels
+        start,
+        end,
+        limit,
+        view=view,
+        min_latency=min_latency,
+        services=services,
+        labels=labels,
     )
     traces = fetch_traces(project, params, max_results=limit)
     if services or max_ms is not None:
@@ -1501,7 +1511,10 @@ def cli(ctx, project, as_json):
     "--limit", default=20, show_default=True, type=int, help="Max traces to fetch"
 )
 @click.option(
-    "--service", "services", multiple=True, help="Filter by service.name (repeatable)"
+    "--service",
+    "services",
+    multiple=True,
+    help="Filter by service.name (substring, repeatable)",
 )
 @click.option("--label", "labels", multiple=True, help="Label key=value (repeatable)")
 @click.option("--min-latency", default=None, help="Min latency (500ms, 1s)")
@@ -1578,7 +1591,10 @@ def services(ctx, start, end, limit):
     "--limit", default=20, show_default=True, type=int, help="Max traces to fetch"
 )
 @click.option(
-    "--service", "services", multiple=True, help="Filter by service.name (repeatable)"
+    "--service",
+    "services",
+    multiple=True,
+    help="Filter by service.name (substring, repeatable)",
 )
 @click.option("--min-latency", default=None, help="Min latency (500ms, 1s)")
 @click.option("--max-latency", default=None, help="Max latency (500ms, 1s)")
@@ -1652,7 +1668,10 @@ def get(ctx, trace_id, bars, name_width):
 @click.option("--min-latency", default=None, help="Min latency (500ms, 1s)")
 @click.option("--max-latency", default=None, help="Max latency (500ms, 1s)")
 @click.option(
-    "--service", "services", multiple=True, help="Filter by service.name (repeatable)"
+    "--service",
+    "services",
+    multiple=True,
+    help="Filter by service.name (substring, repeatable)",
 )
 @click.option(
     "--parent-span-id",
@@ -1987,7 +2006,10 @@ def _compare_services(project, outlier_list, all_traces, compare_svc):
     "--limit", default=50, show_default=True, type=int, help="Max traces to fetch"
 )
 @click.option(
-    "--service", "services", multiple=True, help="Filter by service.name (repeatable)"
+    "--service",
+    "services",
+    multiple=True,
+    help="Filter by service.name (substring, repeatable)",
 )
 @click.option("--label", "labels", multiple=True, help="Label key=value (repeatable)")
 @click.option("--min-latency", default=None, help="Min latency (500ms, 1s)")
@@ -2129,7 +2151,10 @@ def outliers(
     help="Comma-separated label keys to group by",
 )
 @click.option(
-    "--service", "services", multiple=True, help="Filter by service.name (repeatable)"
+    "--service",
+    "services",
+    multiple=True,
+    help="Filter by service.name (substring, repeatable)",
 )
 @click.option("--label", "labels", multiple=True, help="Label key=value (repeatable)")
 @click.option("--min-latency", default=None, help="Min latency (500ms, 1s)")
